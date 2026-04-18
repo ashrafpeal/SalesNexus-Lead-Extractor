@@ -1,17 +1,18 @@
 document.addEventListener("DOMContentLoaded", function () {
 
-    console.log(le_ajax_obj.ajax_url); // Debug: Check if the localized variable is available
-
+    // Toggle API key visibility
     document.getElementById('toggleApiKey').addEventListener('click', function (e) {
         e.preventDefault();
         const input = document.getElementById('le_api_key');
         input.type = input.type === 'password' ? 'text' : 'password';
     });
 
+    // Ensure column name is always uppercase
     document.getElementById('le_column_name').addEventListener('input', function () {
         this.value = this.value.toUpperCase();
     });
 
+    // Save settings via AJAX
     document.getElementById('saveBtn').addEventListener('click', function () {
         const btn = this;
         const status = document.getElementById('saveStatus');
@@ -28,6 +29,7 @@ document.addEventListener("DOMContentLoaded", function () {
                 le_target_sheet_id: document.getElementById('le_target_sheet_id').value.trim(),
                 le_api_key: document.getElementById('le_api_key').value.trim(),
                 le_column_name: document.getElementById('le_column_name').value.trim().toUpperCase(),
+                le_job_titles: document.getElementById('le_job_titles').value.trim(),
                 _wpnonce: le_ajax_obj.nonce
             })
         })
@@ -42,12 +44,14 @@ document.addEventListener("DOMContentLoaded", function () {
             });
     });
 
+    // Log messages to debug area
     function log(msg, color = '#1565c0') {
         document.getElementById('debug').innerHTML +=
             '<span style="color:' + color + '">' + new Date().toLocaleTimeString() + ': ' + msg + '</span><br>';
         document.getElementById('debug').scrollTop = document.getElementById('debug').scrollHeight;
     }
 
+    // Run extraction process
     document.getElementById('runBtn').addEventListener('click', function () {
         document.getElementById('status').innerText = '⏳ Processing all emails...';
         document.getElementById('status').style.color = 'blue';

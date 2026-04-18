@@ -1,12 +1,16 @@
 .wrap {
 
+    h1{
+        font-size: 24px;
+        margin-bottom: 20px;
+    }
+
     .wrapper {
         background: #fff;
         border: 1px solid #ccd0d4;
         border-radius: 4px;
         padding: 24px;
         margin-bottom: 20px;
-        max-width: 680px;
 
         .title {
             margin-top: 0;
@@ -14,7 +18,7 @@
             border-bottom: 1px solid #eee;
         }
 
-        table{
+        table {
             width: 100%;
             border-collapse: collapse;
 
@@ -22,21 +26,21 @@
                 padding: 10px 0;
 
                 &:first-child {
-                    width: 180px;
+                    width: 130px;
                     font-weight: 600;
                 }
 
-                input{
+                input {
                     width: 80%;
                     box-sizing: border-box;
                 }
 
-                a{
+                a {
                     font-size: 12px;
                     /* display: inline-block; */
                 }
 
-                small{
+                small {
                     color: #666;
                     margin-left: 8px;
                     display: inline-block;
@@ -62,7 +66,7 @@
             min-height: 20px;
         }
 
-        #summaryBox{
+        #summaryBox {
             margin-top: 16px;
             padding: 16px;
             background: #f0f8ff;
@@ -71,7 +75,7 @@
             display: none;
         }
 
-        #errorBox{
+        #errorBox {
             display: none;
             margin-top: 16px;
             padding: 16px;
@@ -79,7 +83,7 @@
             border: 1px solid #ffb3b3;
             border-radius: 4px;
 
-            #errorContent{
+            #errorContent {
                 font-size: 12px;
                 font-family: monospace;
                 max-height: 200px;
@@ -97,6 +101,103 @@
             overflow: auto;
             border: 1px solid #ddd;
             border-radius: 4px;
+        }
+
+        /* Container Styles */
+        .field-guide-container {
+            background: #fff;
+            border: 1px solid #ccd0d4;
+            border-radius: 4px;
+            padding: 24px;
+            position: sticky;
+            top: 32px;
+        }
+
+        .field-guide-header {
+            margin-top: 0;
+            padding-bottom: 12px;
+            border-bottom: 1px solid #eee;
+            font-size: 15px;
+        }
+
+        /* Section Blocks */
+        .fg-section {
+            margin-bottom: 18px;
+            padding-bottom: 18px;
+            border-bottom: 1px solid #f0f0f0;
+        }
+
+        .fg-section-last {
+            margin-bottom: 0;
+            padding-bottom: 0;
+            border-bottom: none;
+        }
+
+        /* Typography */
+        .fg-title {
+            margin: 0 0 5px;
+            font-weight: 700;
+            color: #1d2327;
+        }
+
+        .fg-description {
+            margin: 0 0 8px;
+            font-size: 13px;
+            color: #555;
+        }
+
+        .fg-label {
+            margin: 0 0 6px;
+            font-size: 12px;
+            font-weight: 600;
+            color: #333;
+        }
+
+        .fg-helper-text {
+            margin: 6px 0 0;
+            font-size: 12px;
+            color: #777;
+        }
+
+        /* Code and Data Boxes */
+        .fg-code-box {
+            background: #f6f7f7;
+            border: 1px solid #ddd;
+            border-radius: 3px;
+            padding: 8px;
+            font-size: 11px;
+            font-family: monospace;
+            word-break: break-all;
+            line-height: 1.6;
+        }
+
+        .fg-id-highlight {
+            background: #fff3cd;
+            padding: 1px 3px;
+            border-radius: 2px;
+            font-weight: 700;
+        }
+
+        /* Status/Permission Boxes */
+        .fg-status-box {
+            background: #e8f5e9;
+            border: 1px solid #c8e6c9;
+            border-radius: 3px;
+            padding: 7px 9px;
+            font-size: 12px;
+        }
+
+        .fg-warning-box {
+            background: #fff3e0;
+            border: 1px solid #ffe0b2;
+            border-radius: 3px;
+            padding: 7px 9px;
+            font-size: 12px;
+        }
+
+        .fg-alert-text {
+            color: #777;
+            font-size: 12px;
         }
     }
 }

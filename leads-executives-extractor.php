@@ -1,9 +1,11 @@
 <?php
+
 /**
- * Plugin Name: Lead Extractor
+ * Plugin Name: SalesNexus Lead Extractor
  * Description: Extracts executive leads from Google Sheet and writes to another Google Sheet using ProfileAPI.
- * Version: 0.2 - Full loop + error recovery
+ * Version: 0.1
  * Author: Ashraf Uddin
+ * Author URI: https://www.facebook.com/ashraf.peal/
  */
 
 require_once __DIR__ . '/vendor/autoload.php';
@@ -90,7 +92,6 @@ class Lead_Executives_Extractor {
 
             // Header বাদ দিয়ে শুধু data rows
             return array_slice($values, 1);
-
         } catch (Exception $e) {
             error_log('❌ Sheet read error: ' . $e->getMessage());
             return [];
@@ -113,9 +114,15 @@ class Lead_Executives_Extractor {
 
             if (empty($rows) || empty($rows[0]) || ($rows[0][0] ?? '') !== 'Company ID') {
                 $headers = [[
-                    'Company ID', 'Company Name', 'Company Domain',
-                    'Person ID', 'Name', 'LinkedIn URL',
-                    'Experiences', 'Email', 'Phone'
+                    'Company ID',
+                    'Company Name',
+                    'Company Domain',
+                    'Person ID',
+                    'Name',
+                    'LinkedIn URL',
+                    'Experiences',
+                    'Email',
+                    'Phone'
                 ]];
                 $body   = new Google_Service_Sheets_ValueRange(['values' => $headers]);
                 $params = ['valueInputOption' => 'RAW'];
@@ -164,7 +171,6 @@ class Lead_Executives_Extractor {
 
             error_log("✅ Row $next_row written: " . ($row_data['name'] ?? ''));
             return $result->getUpdatedCells() > 0;
-
         } catch (Exception $e) {
             error_log('❌ Sheet write error: ' . $e->getMessage());
             return false;
@@ -217,7 +223,6 @@ class Lead_Executives_Extractor {
                 'id'   => $result['id']   ?? '',
                 'name' => $result['name'] ?? $domain,
             ];
-
         } catch (Exception $e) {
             error_log('❌ Company API error: ' . $e->getMessage());
             return null;
@@ -229,7 +234,7 @@ class Lead_Executives_Extractor {
     // =========================================================
     private function get_persons($company_id) {
         try {
-            $titles      = ['ceo', 'cto', 'cfo', 'vp', 'director', 'manager', 'head', 'president', 'founder'];
+            $titles      = get_option('le_job_titles', []);
             $filters_any = array_map(fn($t) => ['key' => 'titleAtCurrentCompany', 'value' => $t, 'operator' => '~'], $titles);
 
             $response = wp_remote_post('https://api.profileapi.com/2024-03-01/persons/find', [
@@ -302,7 +307,6 @@ class Lead_Executives_Extractor {
             }
 
             return $full_persons;
-
         } catch (Exception $e) {
             error_log('❌ Persons API error: ' . $e->getMessage());
             return [];
@@ -329,7 +333,6 @@ class Lead_Executives_Extractor {
             }
 
             return json_decode(wp_remote_retrieve_body($response), true) ?? [];
-
         } catch (Exception $e) {
             error_log('❌ Email lookup failed for ' . $person_id . ': ' . $e->getMessage());
             return []; // ✅ fail হলে empty return — process বন্ধ হবে না
@@ -356,7 +359,6 @@ class Lead_Executives_Extractor {
             }
 
             return json_decode(wp_remote_retrieve_body($response), true) ?? [];
-
         } catch (Exception $e) {
             error_log('❌ Phone lookup failed for ' . $person_id . ': ' . $e->getMessage());
             return []; // ✅ fail হলে empty return — process বন্ধ হবে না
@@ -515,7 +517,6 @@ class Lead_Executives_Extractor {
                         $domain_written++;
                         $this->summary['total_persons']++;
                     }
-
                 } catch (Exception $e) {
                     // ✅ একজন person এ error হলেও পরের person চলবে
                     error_log("❌ Person processing error: " . $e->getMessage());
@@ -531,8 +532,6 @@ class Lead_Executives_Extractor {
                 error_log("⏸️ Process paused after 5 persons for domain: $domain");
                 break; // ✅ শুধু প্রথম 5 জন process করো (testing এর জন্য)
             }
-            
-
         } // ✅ foreach rows শেষ
 
         // ——— Final Summary ———
@@ -564,81 +563,161 @@ class Lead_Executives_Extractor {
     // Admin UI
     // =========================================================
     public function menu() {
-        add_menu_page('Lead Extractor', 'Lead Extractor', 'manage_options', 'lead-extractor-ultra', [$this, 'admin_page']);
+        add_menu_page('Lead Extractor', 'Lead Extractor', 'manage_options', 'lead-extractor-ultra', [$this, 'admin_page'], 'dashicons-clipboard', 6);
     }
 
     public function admin_page() {
         $source_id = esc_attr(get_option('le_source_sheet_id', ''));
         $target_id = esc_attr(get_option('le_target_sheet_id', ''));
         $api_key   = esc_attr(get_option('le_api_key', ''));
-        $col_name  = esc_attr(get_option('le_column_name', 'Y'));
+        $col_name  = esc_attr(get_option('le_column_name', ''));
+        $job_titles = esc_attr(implode(', ', get_option('le_job_titles', [])));
 ?>
         <div class="wrap">
-            <h1>🔥 Lead Extractor Ultra v0.2</h1>
+            <h1>🔥 SalesNexus Lead Extractor</h1>
 
-            <div class="wrapper">
-                <h2 class="title">⚙️ Settings</h2>
-                <table>
-                    <tr>
-                        <td><label for="le_source_sheet_id">Source Sheet ID</label></td>
-                        <td>
-                            <input type="text" id="le_source_sheet_id" value="<?php echo $source_id; ?>"/>
-                            <?php if ($source_id): ?><a href="https://docs.google.com/spreadsheets/d/<?php echo $source_id; ?>/edit" target="_blank">🔗 Open</a><?php endif; ?>
-                        </td>
-                    </tr>
-                    <tr>
-                        <td><label for="le_target_sheet_id">Target Sheet ID</label></td>
-                        <td>
-                            <input type="text" id="le_target_sheet_id" value="<?php echo $target_id; ?>"/>
-                            <?php if ($target_id): ?><a href="https://docs.google.com/spreadsheets/d/<?php echo $target_id; ?>/edit" target="_blank" >🔗 Open</a><?php endif; ?>
-                        </td>
-                    </tr>
-                    <tr>
-                        <td><label for="le_api_key">Profile API Key</label></td>
-                        <td>
-                            <input type="password" id="le_api_key" value="<?php echo $api_key; ?>"/>
-                            <a href="#" id="toggleApiKey">👁 Show/Hide</a>
-                        </td>
-                    </tr>
-                    <tr>
-                        <td><label for="le_column_name">Email Column</label></td>
-                        <td>
-                            <input type="text" id="le_column_name" value="<?php echo $col_name; ?>" maxlength="3" />
-                            <small>Email column letter (A, B, Y...)</small>
-                        </td>
-                    </tr>
-                </table>
-                <div class="save-section">
-                    <button id="saveBtn" class="button button-primary">💾 Save Settings</button>
-                    <span id="saveStatus"></span>
-                </div>
-            </div>
+            <div class="row">
+                <div class="col-md-8">
+                    <div class="wrapper">
+                        <h2 class="title">⚙️ Settings</h2>
+                        <table>
+                            <tr>
+                                <td><label for="le_source_sheet_id">Source Sheet ID</label></td>
+                                <td>
+                                    <input type="text" id="le_source_sheet_id" value="<?php echo $source_id; ?>" />
+                                    <?php if ($source_id): ?><a href="https://docs.google.com/spreadsheets/d/<?php echo $source_id; ?>/edit" target="_blank">🔗 Open</a><?php endif; ?>
+                                </td>
+                            </tr>
+                            <tr>
+                                <td><label for="le_target_sheet_id">Target Sheet ID</label></td>
+                                <td>
+                                    <input type="text" id="le_target_sheet_id" value="<?php echo $target_id; ?>" />
+                                    <?php if ($target_id): ?><a href="https://docs.google.com/spreadsheets/d/<?php echo $target_id; ?>/edit" target="_blank">🔗 Open</a><?php endif; ?>
+                                </td>
+                            </tr>
+                            <tr>
+                                <td><label for="le_api_key">Profile API Key</label></td>
+                                <td>
+                                    <input type="password" id="le_api_key" value="<?php echo $api_key; ?>" />
+                                    <a href="#" id="toggleApiKey">👁 Show/Hide</a>
+                                </td>
+                            </tr>
+                            <tr>
+                                <td><label for="le_column_name">Email Column</label></td>
+                                <td>
+                                    <input type="text" id="le_column_name" value="<?php echo $col_name; ?>" maxlength="3" />
+                                    <small>Email column letter (A, B, Y...)</small>
+                                </td>
+                            </tr>
+                            <tr>
+                                <td><label for="le_job_titles">Job Titles</label></td>
+                                <td>
+                                    <input
+                                        type="text"
+                                        id="le_job_titles"
+                                        name="le_job_titles"
+                                        value="<?php echo $job_titles; ?>"
+                                        placeholder="Enter titles separated by comma (e.g. ceo, cto, manager)"
+                                        style="width:100%;" />
+                                    <small style="color:#666;">
+                                        Example: ceo, cfo, vp, director, manager
+                                    </small>
+                                </td>
+                            </tr>
+                        </table>
+                        <div class="save-section">
+                            <button id="saveBtn" class="button button-primary">💾 Save Settings</button>
+                            <span id="saveStatus"></span>
+                        </div>
+                    </div>
 
-            <div class="wrapper">
-                <h2 class="title">🚀 Run Extractor</h2>
-                <p><strong>Status:</strong> <span id="status" style="color:green;">✅ Ready</span></p>
-                <button id="runBtn" class="button button-primary button-large">🚀 Run All Emails</button>
-                <div id="progress"></div>
+                    <div class="wrapper">
+                        <h2 class="title">🚀 Run Extractor</h2>
+                        <p><strong>Status:</strong> <span id="status" style="color:green;">✅ Ready</span></p>
+                        <button id="runBtn" class="button button-primary button-large">🚀 Run All Emails</button>
+                        <div id="progress"></div>
 
-                <!-- Summary Box -->
-                <div id="summaryBox">
-                    <h3 style="margin:0 0 10px;">📊 Summary</h3>
-                    <div id="summaryContent"></div>
-                </div>
+                        <!-- Summary Box -->
+                        <div id="summaryBox">
+                            <h3 style="margin:0 0 10px;">📊 Summary</h3>
+                            <div id="summaryContent"></div>
+                        </div>
 
-                <!-- Error Box -->
-                <div id="errorBox">
-                    <h3 style="margin:0 0 10px;color:#c0392b;">⚠️ Errors (process চলেছে)</h3>
-                    <div id="errorContent"></div>
-                </div>
+                        <!-- Error Box -->
+                        <div id="errorBox">
+                            <h3 style="margin:0 0 10px;color:#c0392b;">⚠️ Errors (process চলেছে)</h3>
+                            <div id="errorContent"></div>
+                        </div>
 
-                <div id="debug"></div>
-            </div>
+                        <div id="debug"></div>
+                    </div>
+                </div> <!-- col-md-7 -->
+
+                <div class="col-md-4">
+                    <div class="wrapper">
+                        <div class="field-guide-container">
+                            <h2 class="field-guide-header">📖 Field Guide</h2>
+
+                            <div class="fg-section">
+                                <p class="fg-title">📄 Source Sheet ID</p>
+                                <p class="fg-description">The Google Sheet that contains your list of emails to process.</p>
+                                <p class="fg-label">How to get the ID:</p>
+                                <div class="fg-code-box">
+                                    docs.google.com/spreadsheets/d/<span class="fg-id-highlight">1vEB3Dh...Wo_U</span>/edit
+                                </div>
+                                <p class="fg-helper-text">👆 The highlighted part between <code>/d/</code> and <code>/edit</code></p>
+                            </div>
+
+                            <div class="fg-section">
+                                <p class="fg-title">📝 Target Sheet ID</p>
+                                <p class="fg-description">The Google Sheet where extracted executive leads will be written.</p>
+                                <p class="fg-alert-text">⚠️ Both sheets must be shared with your Service Account email: <code>salesnexus@salesnexus-user-sheet.iam.gserviceaccount.com</code>.</p>
+                                <div class="fg-status-box">
+                                    ✅ Source → <strong>Viewer</strong><br>
+                                    ✅ Target → <strong>Editor</strong>
+                                </div>
+                            </div>
+
+                            <div class="fg-section">
+                                <p class="fg-title">🔑 Profile API Key</p>
+                                <p class="fg-description">Your API key from <a href="https://profileapi.com" target="_blank">profileapi.com</a> — used to find company and executive data.</p>
+                                <div class="fg-warning-box">
+                                    🔒 Keep this private. Never share it publicly.
+                                </div>
+                            </div>
+
+                            <div class="fg-section">
+                                <p class="fg-title">📧 Email Column</p>
+                                <p class="fg-description">The column letter in your Source Sheet that contains the email addresses.</p>
+                                <div class="fg-code-box" style="font-size: 12px;">
+                                    A &nbsp;→&nbsp; 1st column<br>
+                                    B &nbsp;→&nbsp; 2nd column<br>
+                                    Y &nbsp;→&nbsp; 25th column<br>
+                                    AA →&nbsp; 27th column
+                                </div>
+                                <p class="fg-helper-text">Row 1 (header) is always skipped automatically.</p>
+                            </div>
+
+                            <div class="fg-section fg-section-last">
+                                <p class="fg-title">🎯 Executive Titles</p>
+                                <p class="fg-description">Job titles to search for at each company. Only people with these titles will be extracted.</p>
+                                <div class="fg-code-box" style="font-size: 12px;">
+                                    ceo, cto, cfo, vp, director,<br>manager, founder, president
+                                </div>
+                                <p class="fg-helper-text">Comma separated. Trailing comma is ignored. Case insensitive.</p>
+                            </div>
+                        </div>
+                    </div><!-- /RIGHT -->
+                </div> <!-- col-md-5 -->
+            </div> <!-- row -->
         </div>
 <?php }
 
-    public function le_enqueue_scripts() {
-
+    public function le_enqueue_scripts($handle) {
+        if ($handle !== 'toplevel_page_lead-extractor-ultra') {
+            return;
+        }
+        wp_enqueue_style('le-flexgrid-styles', plugin_dir_url(__FILE__) . 'assets/css/flexboxgrid.min.css');
         wp_enqueue_style('le-styles', plugin_dir_url(__FILE__) . 'assets/css/main.css', [], time());
         wp_enqueue_script('le-scripts', plugin_dir_url(__FILE__) . 'assets/js/main.js', ['jquery'], time(), true);
 
@@ -646,7 +725,6 @@ class Lead_Executives_Extractor {
             'ajax_url' => admin_url('admin-ajax.php'),
             'nonce'    => wp_create_nonce('le_save_settings'),
         ]);
-      
     }
 
     public function ajax_save_settings() {
@@ -658,10 +736,19 @@ class Lead_Executives_Extractor {
             wp_send_json_error(['message' => 'Unauthorized']);
             return;
         }
+        // Source sheet
         update_option('le_source_sheet_id', sanitize_text_field($_POST['le_source_sheet_id'] ?? ''));
+        // Target sheet
         update_option('le_target_sheet_id', sanitize_text_field($_POST['le_target_sheet_id'] ?? ''));
+        // API key
         update_option('le_api_key',         sanitize_text_field($_POST['le_api_key']         ?? ''));
+        // Column name
         update_option('le_column_name',     strtoupper(sanitize_text_field($_POST['le_column_name'] ?? 'A')));
+        // Job titles
+        $job_titles = array_map('trim', explode(',', sanitize_text_field($_POST['le_job_titles'] ?? '')));
+        update_option('le_job_titles', $job_titles);
+
+        //Return success response
         wp_send_json_success(['message' => 'Settings saved']);
     }
 
