@@ -1,119 +1,442 @@
-document.addEventListener("DOMContentLoaded", function () {
+/**
+ * SalesNexus Lead Extractor — main.js (v2.3)
+ * Changes: Always-on polling for live log updates + live auto sync countdown timer
+ */
 
-    // Toggle API key visibility
-    document.getElementById('toggleApiKey').addEventListener('click', function (e) {
+jQuery(function ($) {
+
+    // =========================================================
+    // State
+    // =========================================================
+    var pollInterval          = null;
+    var syncCountdownInterval = null;
+    var currentPollSpeed      = null; // Tracks active interval speed to avoid unnecessary restarts
+
+    var POLL_FAST_MS = 3000;  // Used when queue is actively running
+    var POLL_SLOW_MS = 15000; // Used when idle/paused/completed — light enough for auto sync detection
+
+    // =========================================================
+    // Settings Save
+    // =========================================================
+    $('#saveBtn').on('click', function () {
+        var $btn    = $(this);
+        var $status = $('#saveStatus');
+
+        $btn.prop('disabled', true).text('Saving...');
+        $status.text('');
+
+        $.post(le_ajax_obj.ajax_url, {
+            action:                  'le_save_settings',
+            _wpnonce:                le_ajax_obj.nonce,
+            le_source_sheet_id:      $('#le_source_sheet_id').val(),
+            le_target_sheet_id:      $('#le_target_sheet_id').val(),
+            le_api_key:              $('#le_api_key').val(),
+            le_column_name:          $('#le_column_name').val(),
+            le_job_titles:           $('#le_job_titles').val(),
+            le_batch_size:           $('#le_batch_size').val(),
+            le_person_limit:         $('#le_person_limit').val(),
+            le_sync_interval:        $('#le_sync_interval').val(),
+            le_output_destination:   $('#le_output_destination').val(),
+            le_salesnexus_api_key:   $('#le_salesnexus_api_key').val(),
+            le_salesnexus_api_url:   $('#le_salesnexus_api_url').val(),
+        }, function (res) {
+            if (res.success) {
+                $status.css('color', 'green').text('✅ ' + res.data.message);
+                $('#currentPersonLimit').text($('#le_person_limit').val());
+                $('#statPersonLimit').text($('#le_person_limit').val());
+            } else {
+                $status.css('color', 'red').text('❌ ' + (res.data.message || 'Error'));
+            }
+        }).fail(function () {
+            $status.css('color', 'red').text('❌ Connection failed.');
+        }).always(function () {
+            $btn.prop('disabled', false).text('💾 Save Settings');
+        });
+    });
+
+    // =========================================================
+    // API Key Show/Hide (Profile API)
+    // =========================================================
+    $('#toggleApiKey').on('click', function (e) {
         e.preventDefault();
-        const input = document.getElementById('le_api_key');
-        input.type = input.type === 'password' ? 'text' : 'password';
+        var $input = $('#le_api_key');
+        $input.attr('type', $input.attr('type') === 'password' ? 'text' : 'password');
     });
 
-    // Ensure column name is always uppercase
-    document.getElementById('le_column_name').addEventListener('input', function () {
-        this.value = this.value.toUpperCase();
+    // =========================================================
+    // SalesNexus API Key Show/Hide
+    // =========================================================
+    $('#toggleSnxKey').on('click', function (e) {
+        e.preventDefault();
+        var $input = $('#le_salesnexus_api_key');
+        $input.attr('type', $input.attr('type') === 'password' ? 'text' : 'password');
     });
 
-    // Save settings via AJAX
-    document.getElementById('saveBtn').addEventListener('click', function () {
-        const btn = this;
-        const status = document.getElementById('saveStatus');
-        btn.disabled = true;
-        btn.innerText = 'Saving...';
-        status.style.display = 'none';
-
-        fetch(le_ajax_obj.ajax_url, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-            body: new URLSearchParams({
-                action: 'le_save_settings',
-                le_source_sheet_id: document.getElementById('le_source_sheet_id').value.trim(),
-                le_target_sheet_id: document.getElementById('le_target_sheet_id').value.trim(),
-                le_api_key: document.getElementById('le_api_key').value.trim(),
-                le_column_name: document.getElementById('le_column_name').value.trim().toUpperCase(),
-                le_job_titles: document.getElementById('le_job_titles').value.trim(),
-                _wpnonce: le_ajax_obj.nonce
-            })
-        })
-            .then(res => res.json())
-            .then(data => {
-                console.log('data', data);
-                status.style.display = 'inline';
-                status.innerText = data.success ? '✅ Saved!' : '❌ Failed';
-                status.style.color = data.success ? 'green' : 'red';
-                btn.disabled = false;
-                btn.innerText = '💾 Save Settings';
-            });
-    });
-
-    // Log messages to debug area
-    function log(msg, color = '#1565c0') {
-        document.getElementById('debug').innerHTML +=
-            '<span style="color:' + color + '">' + new Date().toLocaleTimeString() + ': ' + msg + '</span><br>';
-        document.getElementById('debug').scrollTop = document.getElementById('debug').scrollHeight;
+    // =========================================================
+    // Output Destination — show/hide conditional fields
+    // =========================================================
+    function applyDestinationToggle(val) {
+        if (val === 'salesnexus_api') {
+            $('#snxFields').show();
+            $('#targetSheetFields').hide();
+        } else {
+            $('#snxFields').hide();
+            $('#targetSheetFields').show();
+        }
     }
 
-    // Run extraction process
-    document.getElementById('runBtn').addEventListener('click', function () {
-        document.getElementById('status').innerText = '⏳ Processing all emails...';
-        document.getElementById('status').style.color = 'blue';
-        document.getElementById('progress').innerText = '';
-        document.getElementById('debug').innerHTML = '';
-        document.getElementById('summaryBox').style.display = 'none';
-        document.getElementById('errorBox').style.display = 'none';
-        log('🔄 Starting full extraction...');
-        this.disabled = true;
-        this.innerText = '⏳ Running...';
-
-        const btn = this;
-
-        fetch(le_ajax_obj.ajax_url, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-            body: 'action=le_run_process'
-        })
-            .then(res => res.text())
-            .then(raw => {
-                let data = {};
-                try { data = JSON.parse(raw); } catch (e) { data = { message: raw }; }
-
-                console.log('Response:', data);
-
-                // Summary দেখাও
-                if (data.summary) {
-                    const s = data.summary;
-                    document.getElementById('summaryBox').style.display = 'block';
-                    document.getElementById('summaryContent').innerHTML = `
-                        <table style="border-collapse:collapse;width:100%;">
-                            <tr><td style="padding:4px 8px;">📧 Total Emails</td><td><strong>${s.total_emails}</strong></td></tr>
-                            <tr><td style="padding:4px 8px;color:green;">✅ Success Domains</td><td><strong>${s.success_domains}</strong></td></tr>
-                            <tr><td style="padding:4px 8px;color:red;">❌ Failed Domains</td><td><strong>${s.failed_domains}</strong></td></tr>
-                            <tr><td style="padding:4px 8px;color:orange;">⏭️ Skipped (Duplicate)</td><td><strong>${s.skipped_domains}</strong></td></tr>
-                            <tr><td style="padding:4px 8px;color:blue;">👤 Persons Written</td><td><strong>${s.total_persons}</strong></td></tr>
-                        </table>
-                    `;
-                }
-
-                // Errors দেখাও
-                if (data.errors && data.errors.length > 0) {
-                    document.getElementById('errorBox').style.display = 'block';
-                    document.getElementById('errorContent').innerHTML =
-                        data.errors.map(e => '<div style="margin-bottom:4px;color:#c0392b;">⚠️ ' + e + '</div>').join('');
-                }
-
-                document.getElementById('status').innerText = '✅ Completed';
-                document.getElementById('status').style.color = 'green';
-                document.getElementById('progress').innerHTML = '<strong style="color:green">' + (data.message || 'Done') + '</strong>';
-                log('✅ Extraction complete!', 'green');
-
-                btn.disabled = false;
-                btn.innerText = '🚀 Run All Emails';
-            })
-            .catch(err => {
-                log('❌ Error: ' + err, 'red');
-                document.getElementById('status').innerText = '❌ Error';
-                document.getElementById('status').style.color = 'red';
-                btn.disabled = false;
-                btn.innerText = '🚀 Run All Emails';
-            });
+    $('#le_output_destination').on('change', function () {
+        applyDestinationToggle($(this).val());
     });
 
+    // Apply on page load in case PHP-rendered value differs
+    applyDestinationToggle($('#le_output_destination').val());
+
+    // =========================================================
+    // Run Queue
+    // =========================================================
+    $('#runBtn').on('click', function () {
+        if (! confirm('Start new queue? This will process new domains while keeping current history.')) return;
+
+        setStatus('starting');
+        addLogEntry('🚀 Manual run starting...');
+
+        $.post(le_ajax_obj.ajax_url, { action: 'le_run_process' }, function (res) {
+            if (res.success) {
+                updateUI(res.data.queue);
+                showNotice(res.data.message, 'success');
+            } else {
+                showNotice(res.data.message || 'Error', 'error');
+                setStatus('idle');
+            }
+        });
+    });
+
+    // =========================================================
+    // Pause
+    // =========================================================
+    $('#pauseBtn').on('click', function () {
+        $.post(le_ajax_obj.ajax_url, { action: 'le_pause_queue' }, function (res) {
+            if (res.success) {
+                setStatus('paused');
+                addLogEntry('⏸ Queue paused');
+                showNotice(res.data.message, 'info');
+            }
+        });
+    });
+
+    // =========================================================
+    // Resume
+    // =========================================================
+    $('#resumeBtn').on('click', function () {
+        $.post(le_ajax_obj.ajax_url, { action: 'le_resume_queue' }, function (res) {
+            if (res.success) {
+                setStatus('running');
+                addLogEntry('▶️ Queue resumed');
+                showNotice(res.data.message, 'success');
+            }
+        });
+    });
+
+    // =========================================================
+    // Reset
+    // =========================================================
+    $('#resetBtn').on('click', function () {
+        if (! confirm('⚠️ All queue and processed domain history will be deleted. Confirm?')) return;
+
+        $.post(le_ajax_obj.ajax_url, { action: 'le_reset_queue' }, function (res) {
+            if (res.success) {
+                resetUI();
+                showNotice(res.data.message, 'success');
+            }
+        });
+    });
+
+    // =========================================================
+    // Toggle Auto Sync
+    // =========================================================
+    $('#toggleSyncBtn').on('click', function () {
+        $.post(le_ajax_obj.ajax_url, { action: 'le_toggle_sync' }, function (res) {
+            if (res.success) {
+                var enabled = res.data.enabled;
+                $('#syncStatus')
+                    .text(enabled ? 'Enabled' : 'Disabled')
+                    .removeClass('le-badge-running le-badge-idle')
+                    .addClass(enabled ? 'le-badge-running' : 'le-badge-idle');
+                $('#toggleSyncBtn')
+                    .text(enabled ? '⏸ Disable Sync' : '▶️ Enable Sync')
+                    .removeClass('button-primary button-secondary')
+                    .addClass(enabled ? 'button-secondary' : 'button-primary');
+                showNotice(res.data.message, enabled ? 'success' : 'info');
+
+                // Restart countdown after toggling — next_sync will update on next poll
+                if (! enabled) {
+                    stopSyncCountdown();
+                    $('.le-sync-countdown').text('Not scheduled');
+                }
+            }
+        });
+    });
+
+    // =========================================================
+    // POLLING — Adaptive speed + Page Visibility API
+    // Fast (3s) when running, slow (15s) when idle — stops when tab is hidden
+    // =========================================================
+
+    // Start (or restart) polling at the given speed; skips restart if speed unchanged
+    function startPolling(fast) {
+        var speed = fast ? POLL_FAST_MS : POLL_SLOW_MS;
+
+        // Avoid clearing and re-setting if already running at the correct speed
+        if (pollInterval && currentPollSpeed === speed) return;
+
+        stopPolling();
+        currentPollSpeed = speed;
+        fetchProgress(); // Immediate fetch on start
+        pollInterval = setInterval(fetchProgress, speed);
+    }
+
+    function stopPolling() {
+        if (pollInterval) {
+            clearInterval(pollInterval);
+            pollInterval     = null;
+            currentPollSpeed = null;
+        }
+    }
+
+    function fetchProgress() {
+        $.post(le_ajax_obj.ajax_url, { action: 'le_get_progress' }, function (res) {
+            if (res.success) {
+                updateUI(res.data);
+            }
+        });
+    }
+
+    // Pause all timers when tab is hidden; resume immediately when tab is visible again
+    document.addEventListener('visibilitychange', function () {
+        if (document.hidden) {
+            stopPolling();
+            stopSyncCountdown();
+        } else {
+            // Resume polling at the right speed based on current badge status
+            var isRunning = $('#queueStatus').hasClass('le-badge-running');
+            startPolling(isRunning);
+            // Countdown will be restarted automatically by the next updateUI call
+        }
+    });
+
+    // =========================================================
+    // LIVE COUNTDOWN — Updates every second using next_sync Unix timestamp
+    // =========================================================
+    function startSyncCountdown(nextSyncTs) {
+        // Clear any existing countdown before starting a new one
+        stopSyncCountdown();
+
+        if (! nextSyncTs) {
+            $('.le-sync-countdown').text('Not scheduled');
+            return;
+        }
+
+        function tick() {
+            var nowTs    = Math.floor(Date.now() / 1000);
+            var diff     = nextSyncTs - nowTs;
+
+            if (diff <= 0) {
+                $('.le-sync-countdown').text('Running soon...');
+                stopSyncCountdown();
+                return;
+            }
+
+            var hours   = Math.floor(diff / 3600);
+            var minutes = Math.floor((diff % 3600) / 60);
+            var seconds = diff % 60;
+
+            var display = '';
+            if (hours > 0) {
+                display = hours + 'h ' + pad(minutes) + 'm ' + pad(seconds) + 's';
+            } else if (minutes > 0) {
+                display = minutes + 'm ' + pad(seconds) + 's';
+            } else {
+                display = seconds + 's';
+            }
+
+            $('.le-sync-countdown').text('in ' + display);
+        }
+
+        tick(); // Run immediately
+        syncCountdownInterval = setInterval(tick, 1000);
+    }
+
+    function stopSyncCountdown() {
+        if (syncCountdownInterval) {
+            clearInterval(syncCountdownInterval);
+            syncCountdownInterval = null;
+        }
+    }
+
+    // =========================================================
+    // UPDATE UI — Update all elements from polled data
+    // =========================================================
+    function updateUI(data) {
+        // Status badge
+        setStatus(data.status);
+
+        // Adjust polling speed — fast only when actively running, slow otherwise
+        startPolling(data.status === 'running');
+
+        // Current domain — show real-time
+        if (data.current_domain) {
+            $('#currentDomainBox').show();
+            $('#currentDomainText').text(data.current_domain);
+        } else {
+            $('#currentDomainBox').hide();
+            $('#currentDomainText').text('');
+        }
+
+        // Progress bar
+        $('#progressFill').css('width', data.percent + '%');
+        $('#progressLabel').text(data.done + ' / ' + data.total + ' (' + data.percent + '%)');
+
+        // Stats
+        $('#statPersons').text(data.summary.total_persons);
+        $('#statSuccess').text(data.summary.success_domains);
+        $('#statFailed').text(data.summary.failed_domains);
+        $('#statPending').text(data.pending);
+        $('#statAllTime').text(data.processed_all_time);
+
+        if (data.person_limit) $('#statPersonLimit').text(data.person_limit);
+
+        // Activity log — always replace with latest from server
+        if (data.log && data.log.length > 0) {
+            renderLog(data.log);
+        }
+
+        // Restart countdown with fresh timestamp from server
+        // next_sync changes after each auto sync run, so we always use server value
+        if (typeof data.next_sync !== 'undefined') {
+            startSyncCountdown(data.next_sync);
+        }
+
+        // Error box
+        if (data.summary.errors && data.summary.errors.length > 0) {
+            var $list = $('#errorList').empty();
+            data.summary.errors.forEach(function (err) {
+                $list.append('<li>' + escHtml(err) + '</li>');
+            });
+            $('#errorBox').show();
+        }
+    }
+
+    // =========================================================
+    // RENDER LOG — Replace log body with latest entries from server
+    // =========================================================
+    function renderLog(entries) {
+        var $body = $('#logBody').empty();
+
+        if (entries.length === 0) {
+            $body.append('<div class="le-log-empty">No activity</div>');
+            return;
+        }
+
+        entries.forEach(function (entry) {
+            var $div = $('<div class="le-log-entry"></div>');
+            $div.append('<span class="le-log-time">' + escHtml(entry.time) + '</span>');
+            $div.append('<span class="le-log-msg">'  + escHtml(entry.msg)  + '</span>');
+            $body.append($div);
+        });
+    }
+
+    // Add a temporary client-side log entry (before next poll overwrites)
+    function addLogEntry(msg) {
+        var now  = new Date();
+        var time = now.getHours() + ':' + pad(now.getMinutes()) + ':' + pad(now.getSeconds());
+        var $body = $('#logBody');
+
+        $body.find('.le-log-empty').remove();
+
+        var $div = $('<div class="le-log-entry new-entry"></div>');
+        $div.append('<span class="le-log-time">' + time + '</span>');
+        $div.append('<span class="le-log-msg">'  + escHtml(msg) + '</span>');
+        $body.prepend($div);
+
+        $body.find('.le-log-entry').slice(20).remove();
+    }
+
+    // =========================================================
+    // STATUS BADGE UPDATE
+    // =========================================================
+    function setStatus(status) {
+        var labels = {
+            'idle':      'IDLE',
+            'running':   'RUNNING',
+            'paused':    'PAUSED',
+            'completed': 'COMPLETED',
+            'error':     'ERROR',
+            'starting':  'STARTING...',
+        };
+
+        $('#queueStatus')
+            .text(labels[status] || status.toUpperCase())
+            .attr('class', 'le-badge le-badge-' + status);
+    }
+
+    // =========================================================
+    // RESET UI
+    // =========================================================
+    function resetUI() {
+        setStatus('idle');
+        $('#currentDomainBox').hide();
+        $('#currentDomainText').text('');
+        $('#progressFill').css('width', '0%');
+        $('#progressLabel').text('0 / 0 (0%)');
+        $('#statPersons, #statSuccess, #statFailed, #statPending').text('0');
+        $('#errorBox').hide();
+        $('#logBody').html('<div class="le-log-empty">No activity</div>');
+        addLogEntry('🗑 Queue and history reset');
+    }
+
+    // =========================================================
+    // NOTICE
+    // =========================================================
+    function showNotice(message, type) {
+        var colorMap  = { success: '#d4edda', error: '#f8d7da', info: '#d1ecf1' };
+        var borderMap = { success: '#28a745', error: '#dc3545', info: '#17a2b8' };
+
+        var $notice = $('<div></div>').text(message).css({
+            position:     'fixed',
+            top:          '40px',
+            right:        '20px',
+            background:   colorMap[type]  || colorMap.info,
+            border:       '1px solid ' + (borderMap[type] || borderMap.info),
+            padding:      '12px 20px',
+            borderRadius: '5px',
+            zIndex:       99999,
+            fontSize:     '14px',
+            maxWidth:     '350px',
+            boxShadow:    '0 2px 8px rgba(0,0,0,0.15)',
+        });
+
+        $('body').append($notice);
+        setTimeout(function () { $notice.fadeOut(400, function () { $(this).remove(); }); }, 3500);
+    }
+
+    // =========================================================
+    // Helpers
+    // =========================================================
+    function escHtml(str) {
+        return String(str)
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;');
+    }
+
+    function pad(n) { return n < 10 ? '0' + n : n; }
+
+    // =========================================================
+    // Init — Start polling and countdown on page load
+    // Fast if queue is already running, slow otherwise
+    // =========================================================
+    startPolling(le_ajax_obj.queue_status === 'running');
+    startSyncCountdown(le_ajax_obj.next_sync);
 });

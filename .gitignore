@@ -1,0 +1,6 @@
+# Ignore .claude directory
+.claude/
+# Ignore vendor directory
+vendor/
+doc.text
+SALESNEXUS-API-DOCS.md
