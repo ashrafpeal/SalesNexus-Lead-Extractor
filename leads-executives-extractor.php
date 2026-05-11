@@ -39,6 +39,7 @@ class Lead_Executives_Extractor {
     private $sheets_service    = null;
     private $salesnexus_api_key;
     private $salesnexus_api_url = 'https://api-beta.salesnex.us';
+    private $last_sheet_error  = '';
 
     // =========================================================
     // Constructor
@@ -441,141 +442,143 @@ class Lead_Executives_Extractor {
 
         error_log("LE: {$batch_size} domains will be processed in this batch");
 
+        $destination = get_option('le_output_destination', 'salesnexus_api');
+        $use_sheet   = ($destination === 'target_sheet');
+        $use_snx     = ($destination === 'salesnexus_api');
+
         foreach ($batch as $item) {
             $domain  = $item['domain'];
             $retries = $item['retries'] ?? 0;
 
             // Skip if domain was processed by a parallel batch or a previous run
             if ($this->is_domain_processed($domain)) {
-                error_log("LE: ⏭ Domain already processed, skip: $domain");
                 $this->add_log($queue, "⏭ Skip (already done): $domain");
                 continue;
             }
 
-            // ✅ FIX: current_domain is being saved immediately
             $queue['current_domain'] = $domain;
-            $this->add_log($queue, "🎯 Processing started: $domain (attempt #{$retries})");
+            $this->add_log($queue, "🎯 Processing: $domain (attempt #{$retries})");
             $this->update_queue($queue);
 
-            error_log("LE: 🎯 Processing: $domain (try #{$retries})");
+            // Wrap each domain in try-catch so one failure never stops the whole batch
+            try {
 
-            // ——— Finding Company ———
-            $company = $this->api_call_with_retry(function () use ($domain) {
-                return $this->get_company($domain);
-            });
+                // ——— Finding Company ———
+                $company = $this->api_call_with_retry(function () use ($domain) {
+                    return $this->get_company($domain);
+                });
 
-            if (! $company) {
-                if ($retries < self::MAX_RETRY) {
-                    $item['retries']++;
-                    $retry_back[] = $item;
-                    $this->add_log($queue, "⚠️ Company not found, will retry: $domain");
-                    error_log("LE: ⚠️ Company not found, will retry: $domain");
-                } else {
-                    $queue['failed'][]                    = $domain;
-                    $queue['processed'][]                 = $domain;
-                    $queue['summary']['failed_domains']++;
-                    $queue['summary']['errors'][]         = "Company not found (max retry): $domain"; 
-                    $this->mark_domain_processed($domain);
-                    $this->add_log($queue, "❌ Failed (max retry): $domain");
-                    error_log("LE: ❌ Company max retry exhausted: $domain");
-                }
-                continue;
-            }
-
-            $this->add_log($queue, "🏢 Company found: {$company['name']}");
-
-            // ——— Finding Persons ———
-            $persons = $this->api_call_with_retry(function () use ($company) {
-                return $this->get_persons($company['id']);
-            });
-
-            if (empty($persons)) {
-                $queue['failed'][]                    = $domain;
-                $queue['processed'][]                 = $domain;
-                $queue['summary']['failed_domains']++;
-                $queue['summary']['errors'][]         = "No executives found: {$company['name']}";
-                $this->mark_domain_processed($domain);
-                $this->add_log($queue, "⚠️ No executives found: {$company['name']}");
-                continue;
-            }
-
-            // ——— Writing to destination ———
-            $destination     = get_option('le_output_destination', 'salesnexus_api');
-            $use_sheet       = ($destination === 'target_sheet');
-            $use_snx         = ($destination === 'salesnexus_api');
-            $snx_contact_ids = []; // collect IDs for batch-update after all persons
-            $written         = 0;
-
-            if ($use_sheet) $this->ensure_header();
-
-            foreach ($persons as $person) {
-                if (empty($person['id'])) continue;
-
-                $person_email = $this->lookup_email($person['id']);
-                $person_phone = $this->lookup_phone($person['id']);
-
-                $row_data = [
-                    'company_id'   => $company['id'],
-                    'company_name' => $company['name'],
-                    'domain'       => $domain,
-                    'person_id'    => $person['id'],
-                    'name'         => $person['name'] ?? trim(($person['firstName'] ?? '') . ' ' . ($person['lastName'] ?? '')),
-                    'linkedin'     => $person['linkedInUrl'] ?? '',
-                    'experiences'  => $this->format_experiences($person['experiences'] ?? []),
-                    'email'        => $person_email['data']['email'] ?? '',
-                    'phone'        => $person_phone['data']['phone'] ?? '',
-                ];
-
-                if ($use_sheet) {
-                    // Write to Google Sheet
-                    if ($this->write_to_sheet($row_data)) {
-                        $written++;
-                        $queue['summary']['total_persons']++;
-                    }
-                } elseif ($use_snx) {
-                    // Step 1: Create contact with basic fields (name, email, phone)
-                    $contact_id = $this->create_salesnexus_contact($row_data);
-                    if ($contact_id) {
-                        $snx_contact_ids[] = $contact_id;
-                        $written++;
-                        $queue['summary']['total_persons']++;
-                        $this->add_log($queue, "📤 SalesNexus contact created: {$row_data['name']}");
-
-                        // Step 2: Per-person custom fields — LinkedIn URL and Experiences
-                        // differ per person so each contact is updated individually
-                        $per_person_fields = array_filter([
-                            'LinkedIn URL' => $row_data['linkedin'],
-                            'Experiences'  => $row_data['experiences'],
-                        ]);
-                        if (! empty($per_person_fields)) {
-                            $result = $this->batch_update_salesnexus_contacts([$contact_id], $per_person_fields);
-                            if (! $result['ok']) {
-                                $this->add_log($queue, "⚠️ LinkedIn/Exp update failed for {$row_data['name']}: {$result['msg']}");
-                            }
-                        }
+                if (! $company) {
+                    if ($retries < self::MAX_RETRY) {
+                        $item['retries']++;
+                        $retry_back[] = $item;
+                        $this->add_log($queue, "⚠️ Company not found, will retry: $domain");
                     } else {
-                        $this->add_log($queue, "⏭ SalesNexus skipped (no email or API error): {$row_data['name']}");
+                        $queue['failed'][]              = $domain;
+                        $queue['processed'][]           = $domain;
+                        $queue['summary']['failed_domains']++;
+                        $queue['summary']['errors'][]   = "Company not found: $domain";
+                        $this->mark_domain_processed($domain);
+                        $this->add_log($queue, "❌ Company not found (max retries): $domain");
+                    }
+                    continue;
+                }
+
+                $this->add_log($queue, "🏢 Company: {$company['name']}");
+
+                // ——— Finding Persons ———
+                $persons = $this->api_call_with_retry(function () use ($company) {
+                    return $this->get_persons($company['id']);
+                });
+
+                if (empty($persons)) {
+                    $queue['failed'][]              = $domain;
+                    $queue['processed'][]           = $domain;
+                    $queue['summary']['failed_domains']++;
+                    $queue['summary']['errors'][]   = "No executives found: {$company['name']}";
+                    $this->mark_domain_processed($domain);
+                    $this->add_log($queue, "⚠️ No executives found: {$company['name']}");
+                    continue;
+                }
+
+                // ——— Collect all person rows (lookup email & phone per person) ———
+                // Each person is collected regardless of whether email/phone was found —
+                // partial data (name, LinkedIn) is still valuable and must be inserted
+                $all_rows = [];
+                foreach ($persons as $person) {
+                    if (empty($person['id'])) continue;
+
+                    $person_email = $this->lookup_email($person['id']);
+                    $person_phone = $this->lookup_phone($person['id']);
+                    $name         = trim(($person['firstName'] ?? '') . ' ' . ($person['lastName'] ?? ''));
+                    if (empty($name)) $name = $person['name'] ?? '';
+
+                    // Skip person only if absolutely no identifying data exists
+                    if (empty($name) && empty($person_email['data']['email'] ?? '')) continue;
+
+                    $all_rows[] = [
+                        'company_id'   => $company['id'],
+                        'company_name' => $company['name'],
+                        'domain'       => $domain,
+                        'person_id'    => $person['id'],
+                        'name'         => $name,
+                        'linkedin'     => $person['linkedInUrl'] ?? '',
+                        'experiences'  => $this->format_experiences($person['experiences'] ?? []),
+                        'email'        => $person_email['data']['email'] ?? '',
+                        'phone'        => $person_phone['data']['phone'] ?? '',
+                    ];
+                }
+
+                $written = 0;
+
+                // ——— Google Sheet: single batch append (1 API call for all persons) ———
+                if ($use_sheet && ! empty($all_rows)) {
+                    $this->ensure_header();
+                    $written = $this->write_rows_to_sheet($all_rows);
+                    $queue['summary']['total_persons'] += $written;
+                    if ($written > 0) {
+                        $this->add_log($queue, "📊 Sheet: {$written} rows written for {$domain}");
                     }
                 }
-            }
 
-            // One batch-update call sets Company Name + Domain for ALL contacts from this domain
-            if ($use_snx && ! empty($snx_contact_ids)) {
-                $result = $this->batch_update_salesnexus_contacts($snx_contact_ids, [
-                    'Company Name'  => $company['name'],
-                    'Source Domain' => $domain,
-                ]);
-                $this->add_log($queue, $result['ok']
-                    ? '✅ SalesNexus batch-update OK: ' . count($snx_contact_ids) . ' contacts'
-                    : '⚠️ SalesNexus batch-update failed for ' . $domain . ' — ' . $result['msg']
-                );
-            }
+                // ——— SalesNexus: one POST /Contacts per person ———
+                if ($use_snx && ! empty($all_rows)) {
+                    $snx_ok   = 0;
+                    $snx_skip = 0;
+                    foreach ($all_rows as $row_data) {
+                        if ($this->create_salesnexus_contact($row_data)) {
+                            $written++;
+                            $snx_ok++;
+                            $queue['summary']['total_persons']++;
+                        } else {
+                            $snx_skip++;
+                        }
+                    }
+                    // Single log line summarising all persons for this domain
+                    if ($snx_ok > 0) {
+                        $this->add_log($queue, "📤 SalesNexus: {$snx_ok} contact(s) sent for {$domain}" . ($snx_skip > 0 ? " ({$snx_skip} skipped)" : ''));
+                    } elseif ($snx_skip > 0) {
+                        $this->add_log($queue, "⚠️ SalesNexus: all {$snx_skip} contacts skipped for {$domain}");
+                    }
+                }
 
-            $queue['summary']['success_domains']++;
-            $queue['processed'][] = $domain;
-            $this->mark_domain_processed($domain);
-            $this->add_log($queue, "✅ Completed: $domain | {$written} persons written");
-            error_log("LE: ✅ Domain completed: $domain | Persons: $written");
+                $queue['summary']['success_domains']++;
+                $queue['processed'][] = $domain;
+                $this->mark_domain_processed($domain);
+                $this->add_log($queue, "✅ Done: $domain | {$written} person(s) saved");
+                error_log("LE: ✅ $domain | saved: $written");
+
+            } catch (Exception $e) {
+                // Log the error and continue to the next domain — never let one domain stop the batch
+                $msg = $e->getMessage();
+                $queue['failed'][]            = $domain;
+                $queue['processed'][]         = $domain;
+                $queue['summary']['failed_domains']++;
+                $queue['summary']['errors'][] = "Exception on $domain: $msg";
+                $this->mark_domain_processed($domain);
+                $this->add_log($queue, "❌ Error on {$domain}: {$msg}");
+                error_log("LE: ❌ Exception on $domain: $msg");
+            }
         }
 
         // Put retry items in front
@@ -678,14 +681,30 @@ class Lead_Executives_Extractor {
     // =========================================================
 
     private function get_sheet_data() {
-        try {
-            $service = $this->get_sheets_service();
-            if (! $service) return [];
+        $this->last_sheet_error = '';
 
+        if (empty($this->sourceSheetId)) {
+            $this->last_sheet_error = 'Source Sheet ID is not configured. Please enter it in Settings and save.';
+            error_log('LE: ' . $this->last_sheet_error);
+            return [];
+        }
+
+        $service = $this->get_sheets_service();
+        if (! $service) {
+            $this->last_sheet_error = 'Could not connect to Google Sheets. Check that credential.json exists and is valid.';
+            error_log('LE: ' . $this->last_sheet_error);
+            return [];
+        }
+
+        try {
             $spreadsheet = $service->spreadsheets->get($this->sourceSheetId);
             $sheets      = $spreadsheet->getSheets();
 
-            if (empty($sheets)) { error_log('❌ No sheet found'); return []; }
+            if (empty($sheets)) {
+                $this->last_sheet_error = 'No sheets found inside the spreadsheet.';
+                error_log('LE: ' . $this->last_sheet_error);
+                return [];
+            }
 
             $sheetName = $sheets[0]->getProperties()->getTitle();
             $col       = strtoupper(get_option('le_column_name', 'A'));
@@ -695,13 +714,24 @@ class Lead_Executives_Extractor {
             $values   = $response->getValues();
 
             if (empty($values) || count($values) < 2) {
-                error_log('LE: Sheet empty or only header');
+                $this->last_sheet_error = 'Sheet column "' . $col . '" is empty or only has a header row. Make sure email addresses are present below the header.';
+                error_log('LE: ' . $this->last_sheet_error);
                 return [];
             }
 
             return array_slice($values, 1);
+
         } catch (Exception $e) {
-            error_log('❌ Sheet read error: ' . $e->getMessage());
+            $msg = $e->getMessage();
+            // Give a friendlier message for the most common Google API errors
+            if (strpos($msg, '403') !== false) {
+                $this->last_sheet_error = 'Access denied (403). Share the Source Sheet with: salesnexus@salesnexus-user-sheet.iam.gserviceaccount.com';
+            } elseif (strpos($msg, '404') !== false) {
+                $this->last_sheet_error = 'Sheet not found (404). Double-check the Source Sheet ID in Settings.';
+            } else {
+                $this->last_sheet_error = $msg;
+            }
+            error_log('❌ Sheet read error: ' . $msg);
             return [];
         }
     }
@@ -735,36 +765,41 @@ class Lead_Executives_Extractor {
     // ✅ WRITE TO SHEET
     // =========================================================
 
-    private function write_to_sheet($row_data) {
+    // Writes all rows in a single append call — replaces the old per-row read+write pattern
+    private function write_rows_to_sheet(array $rows) {
+        if (empty($rows)) return 0;
         try {
             $service = $this->get_sheets_service();
-            if (! $service) return false;
+            if (! $service) return 0;
+
             $spreadsheet = $service->spreadsheets->get($this->targetSheetId);
             $sheetName   = $spreadsheet->getSheets()[0]->getProperties()->getTitle();
-            $existing    = $service->spreadsheets_values->get($this->targetSheetId, $sheetName . '!A:A');
-            $next_row    = count($existing->getValues()) + 1;
-            $values      = [[
-                $row_data['company_id']   ?? '',
-                $row_data['company_name'] ?? '',
-                $row_data['domain']       ?? '',
-                $row_data['person_id']    ?? '',
-                $row_data['name']         ?? '',
-                $row_data['linkedin']     ?? '',
-                $row_data['experiences']  ?? '',
-                $row_data['email']        ?? '',
-                $row_data['phone']        ?? '',
-            ]];
+
+            $values = array_map(fn($r) => [
+                $r['company_id']   ?? '',
+                $r['company_name'] ?? '',
+                $r['domain']       ?? '',
+                $r['person_id']    ?? '',
+                $r['name']         ?? '',
+                $r['linkedin']     ?? '',
+                $r['experiences']  ?? '',
+                $r['email']        ?? '',
+                $r['phone']        ?? '',
+            ], $rows);
+
+            // append finds the next empty row automatically — no read needed
             $body   = new Google_Service_Sheets_ValueRange(['values' => $values]);
-            $result = $service->spreadsheets_values->update(
+            $result = $service->spreadsheets_values->append(
                 $this->targetSheetId,
-                $sheetName . '!A' . $next_row,
+                $sheetName . '!A:I',
                 $body,
-                ['valueInputOption' => 'RAW']
+                ['valueInputOption' => 'RAW', 'insertDataOption' => 'INSERT_ROWS']
             );
-            return $result->getUpdatedCells() > 0;
+
+            return $result->getUpdates()->getUpdatedRows() ?? count($rows);
         } catch (Exception $e) {
-            error_log('❌ Sheet write error: ' . $e->getMessage());
-            return false;
+            error_log('LE: Sheet batch write error: ' . $e->getMessage());
+            return 0;
         }
     }
 
@@ -780,26 +815,44 @@ class Lead_Executives_Extractor {
         ];
     }
 
-    // Creates or updates a contact in SalesNexus (API auto-deduplicates by email).
-    // Returns the contact ID on success, null on failure or missing email.
-    private function create_salesnexus_contact($row_data) {
-        if (empty($row_data['email'])) {
-            error_log('LE SalesNexus: Skipped contact — no email: ' . $row_data['name']);
-            return null;
+    // Creates or updates a SalesNexus contact.
+    // Sends whatever data is available — email, phone, LinkedIn are all optional.
+    // Only skips if there is absolutely no name to identify the person.
+    private function create_salesnexus_contact(array $row_data) {
+        if (empty($this->salesnexus_api_key)) {
+            error_log('LE SalesNexus: API key not set — configure it in Settings');
+            return false;
         }
 
-        $name_parts = explode(' ', trim($row_data['name']), 2);
-        $first_name = $name_parts[0] ?? '';
-        $last_name  = $name_parts[1] ?? '';
+        $name  = trim($row_data['name']  ?? '');
+        $email = trim($row_data['email'] ?? '');
 
-        // Only standard fields here — custom fields (LinkedIn, Experiences) are set
-        // via a separate batch-update call because POST /Contacts may not support customFields
+        // Email is required — skip silently without stopping the batch
+        if (empty($email)) {
+            error_log('LE SalesNexus: Skipped (no email) — ' . ($name ?: 'unknown'));
+            return false;
+        }
+
+        $parts = explode(' ', $name, 2);
+
         $body = [
-            'firstName' => $first_name,
-            'lastName'  => $last_name,
-            'email'     => $row_data['email'],
-            'phone'     => $row_data['phone'],
+            'firstName' => $parts[0] ?? '',
+            'lastName'  => $parts[1] ?? '',
+            'email'     => $email,
         ];
+
+        if (! empty($row_data['phone'])) $body['phone'] = $row_data['phone'];
+
+        // leadSource and ID/Status always sent — fallback ensures empty option never removes them
+        $body['customFields'] = [
+            'leadSource' => get_option('le_salesnexus_lead_source', '') ?: 'Lead Extractor',
+            'idStatus'  => get_option('le_salesnexus_id_status',   '') ?: 'Suspect',
+        ];
+
+        // LinkedIn only added when available
+        if (! empty($row_data['linkedin'])) {
+            $body['customFields']['LinkedIn'] = $row_data['linkedin'];
+        }
 
         $response = wp_remote_post(
             rtrim($this->salesnexus_api_url, '/') . '/api/v1/Contacts',
@@ -811,69 +864,21 @@ class Lead_Executives_Extractor {
         );
 
         if (is_wp_error($response)) {
-            error_log('LE SalesNexus: Create failed — ' . $response->get_error_message());
-            return null;
+            error_log('LE SalesNexus: ' . $response->get_error_message() . ' — ' . $name);
+            return false;
         }
 
         $code = wp_remote_retrieve_response_code($response);
-        $data = json_decode(wp_remote_retrieve_body($response), true);
-
-        // Try common ID field names in case API uses a different casing
-        $contact_id = $data['id'] ?? $data['Id'] ?? $data['contactId'] ?? null;
-
-        if ($code >= 200 && $code < 300 && $contact_id) {
-            return (int) $contact_id;
-        }
-
-        error_log('LE SalesNexus: Create HTTP ' . $code . ' — ' . wp_remote_retrieve_body($response));
-        return null;
-    }
-
-    // Batch-updates fields for given contact IDs.
-    // Returns array: ['ok' => bool, 'msg' => string] so callers can log the exact error.
-    private function batch_update_salesnexus_contacts(array $contact_ids, array $field_updates) {
-        if (empty($contact_ids)) {
-            return ['ok' => false, 'msg' => 'No contact IDs provided'];
-        }
-
-        $body = [
-            'selectionMode' => 'ids',
-            'contactIds'    => array_values($contact_ids),
-            'lookupId'      => null,
-            'fieldUpdates'  => $field_updates,
-        ];
-
-        $response = wp_remote_post(
-            rtrim($this->salesnexus_api_url, '/') . '/api/v1/Contacts/batch-update',
-            [
-                'headers' => $this->get_salesnexus_headers(),
-                'body'    => wp_json_encode($body),
-                'timeout' => 30,
-            ]
-        );
-
-        if (is_wp_error($response)) {
-            $msg = 'Connection error: ' . $response->get_error_message();
-            error_log('LE SalesNexus: Batch update failed — ' . $msg);
-            return ['ok' => false, 'msg' => $msg];
-        }
-
-        $code      = wp_remote_retrieve_response_code($response);
-        $body_raw  = wp_remote_retrieve_body($response);
-        $data      = json_decode($body_raw, true);
-
         if ($code >= 200 && $code < 300) {
-            $count = $data['successCount'] ?? '?';
-            error_log('LE SalesNexus: Batch update OK — ' . $count . ' contacts');
-            return ['ok' => true, 'msg' => $count . ' contacts updated'];
+            $id = json_decode(wp_remote_retrieve_body($response), true)['id'] ?? '?';
+            error_log('LE SalesNexus: Saved ID:' . $id . ' — ' . $name);
+            return true;
         }
 
-        // Extract a readable error from the API response
-        $api_error = $data['message'] ?? $data['error'] ?? $data['title'] ?? $body_raw;
-        $msg = 'HTTP ' . $code . ': ' . $api_error;
-        error_log('LE SalesNexus: Batch update failed — ' . $msg);
-        return ['ok' => false, 'msg' => $msg];
+        error_log('LE SalesNexus: HTTP ' . $code . ' — ' . $name . ' — ' . wp_remote_retrieve_body($response));
+        return false;
     }
+
 
     // =========================================================
     // ✅ FIX 1 (Person Limit): Use get_person_limit() in get_persons()
@@ -1026,7 +1031,8 @@ class Lead_Executives_Extractor {
         }
         $rows = $this->get_sheet_data();
         if (empty($rows)) {
-            wp_send_json_error(['message' => '❌ Source sheet empty or cannot be read.']);
+            $reason = $this->last_sheet_error ?: 'Source sheet is empty or cannot be read.';
+            wp_send_json_error(['message' => '❌ ' . $reason]);
             return;
         }
         $queue = $this->init_queue($rows, 'manual', false);
@@ -1127,9 +1133,11 @@ class Lead_Executives_Extractor {
         if (! in_array($destination, ['target_sheet', 'salesnexus_api'], true)) {
             $destination = 'salesnexus_api';
         }
-        update_option('le_output_destination', $destination);
-        update_option('le_salesnexus_api_key', sanitize_text_field($_POST['le_salesnexus_api_key'] ?? ''));
-        update_option('le_salesnexus_api_url', esc_url_raw($_POST['le_salesnexus_api_url'] ?? 'https://api-beta.salesnex.us'));
+        update_option('le_output_destination',      $destination);
+        update_option('le_salesnexus_api_key',      sanitize_text_field($_POST['le_salesnexus_api_key']      ?? ''));
+        update_option('le_salesnexus_api_url',      esc_url_raw($_POST['le_salesnexus_api_url']              ?? 'https://api-beta.salesnex.us'));
+        update_option('le_salesnexus_lead_source',  sanitize_text_field($_POST['le_salesnexus_lead_source']  ?? 'Lead Extractor'));
+        update_option('le_salesnexus_id_status',    sanitize_text_field($_POST['le_salesnexus_id_status']    ?? 'Suspect'));
 
         wp_send_json_success(['message' => '✅ Settings saved!']);
     }
@@ -1186,8 +1194,10 @@ class Lead_Executives_Extractor {
         $sync_interval      = esc_attr(get_option('le_sync_interval', 'le_hourly'));
         $next_sync          = wp_next_scheduled(self::SYNC_CRON_HOOK);
         $output_destination = get_option('le_output_destination', 'salesnexus_api');
-        $snx_api_key        = esc_attr(get_option('le_salesnexus_api_key', ''));
-        $snx_api_url        = esc_attr(get_option('le_salesnexus_api_url', 'https://api-beta.salesnex.us'));
+        $snx_api_key        = esc_attr(get_option('le_salesnexus_api_key',     ''));
+        $snx_api_url        = esc_attr(get_option('le_salesnexus_api_url',     'https://api-beta.salesnex.us'));
+        $snx_lead_source    = esc_attr(get_option('le_salesnexus_lead_source', 'Lead Extractor'));
+        $snx_id_status      = esc_attr(get_option('le_salesnexus_id_status',   'Suspect'));
 
         $queue    = $this->get_queue();
         $progress = $this->format_progress($queue);
@@ -1238,6 +1248,15 @@ class Lead_Executives_Extractor {
                     <div class="le-field-group">
                         <label class="le-field-label" for="le_salesnexus_api_url">🌐 SalesNexus API URL</label>
                         <input type="text" id="le_salesnexus_api_url" value="<?php echo $snx_api_url; ?>" class="le-input-full" />
+                    </div>
+                    <div class="le-field-group">
+                        <label class="le-field-label" for="le_salesnexus_lead_source">📋 Lead Source</label>
+                        <input type="text" id="le_salesnexus_lead_source" value="<?php echo $snx_lead_source; ?>" placeholder="Lead Extractor" class="le-input-full" />
+                    </div>
+                    <div class="le-field-group">
+                        <label class="le-field-label" for="le_salesnexus_id_status">🏷️ ID / Status</label>
+                        <input type="text" id="le_salesnexus_id_status" value="<?php echo $snx_id_status; ?>" placeholder="Suspect" class="le-input-full" />
+                        <p class="le-field-hint">Predefined values: Suspect, Client, Partner, Referral, Contractor, Employee, etc.</p>
                     </div>
                 </div>
 
