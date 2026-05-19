@@ -36,11 +36,11 @@ jQuery(function ($) {
             le_batch_size:           $('#le_batch_size').val(),
             le_person_limit:         $('#le_person_limit').val(),
             le_sync_interval:        $('#le_sync_interval').val(),
-            le_output_destination:     $('#le_output_destination').val(),
-            le_salesnexus_api_key:     $('#le_salesnexus_api_key').val(),
-            le_salesnexus_api_url:     $('#le_salesnexus_api_url').val(),
-            le_salesnexus_lead_source: $('#le_salesnexus_lead_source').val(),
-            le_salesnexus_id_status:   $('#le_salesnexus_id_status').val(),
+            le_output_destination:        $('#le_output_destination').val(),
+            le_salesnexus_webhook_token:  $('#le_salesnexus_webhook_token').val(),
+            le_salesnexus_api_url:        $('#le_salesnexus_api_url').val(),
+            le_salesnexus_lead_source:    $('#le_salesnexus_lead_source').val(),
+            le_salesnexus_id_status:      $('#le_salesnexus_id_status').val(),
         }, function (res) {
             if (res.success) {
                 $status.css('color', 'green').text('✅ ' + res.data.message);
@@ -66,11 +66,11 @@ jQuery(function ($) {
     });
 
     // =========================================================
-    // SalesNexus API Key Show/Hide
+    // SalesNexus Webhook Token Show/Hide
     // =========================================================
-    $('#toggleSnxKey').on('click', function (e) {
+    $('#toggleSnxToken').on('click', function (e) {
         e.preventDefault();
-        var $input = $('#le_salesnexus_api_key');
+        var $input = $('#le_salesnexus_webhook_token');
         $input.attr('type', $input.attr('type') === 'password' ? 'text' : 'password');
     });
 

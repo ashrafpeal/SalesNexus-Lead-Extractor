@@ -513,8 +513,19 @@ class Lead_Executives_Extractor {
                     $name         = trim(($person['firstName'] ?? '') . ' ' . ($person['lastName'] ?? ''));
                     if (empty($name)) $name = $person['name'] ?? '';
 
-                    // Skip person only if absolutely no identifying data exists
                     if (empty($name) && empty($person_email['data']['email'] ?? '')) continue;
+
+                    // Extract current job title from experiences
+                    $current_title = '';
+                    foreach ($person['experiences'] ?? [] as $exp) {
+                        if (! empty($exp['isCurrent'])) {
+                            $current_title = $exp['title'] ?? '';
+                            break;
+                        }
+                    }
+                    if (empty($current_title)) {
+                        $current_title = $person['titleAtCurrentCompany'] ?? '';
+                    }
 
                     $all_rows[] = [
                         'company_id'   => $company['id'],
@@ -522,6 +533,7 @@ class Lead_Executives_Extractor {
                         'domain'       => $domain,
                         'person_id'    => $person['id'],
                         'name'         => $name,
+                        'title'        => $current_title,
                         'linkedin'     => $person['linkedInUrl'] ?? '',
                         'experiences'  => $this->format_experiences($person['experiences'] ?? []),
                         'email'        => $person_email['data']['email'] ?? '',
@@ -815,67 +827,54 @@ class Lead_Executives_Extractor {
         ];
     }
 
-    // Creates or updates a SalesNexus contact.
-    // Sends whatever data is available — email, phone, LinkedIn are all optional.
-    // Only skips if there is absolutely no name to identify the person.
+    // Creates or updates a SalesNexus contact via the upsert-contact webhook.
+    // Webhook auto-deduplicates by email, name auto-splits, no X-Api-Key needed.
     private function create_salesnexus_contact(array $row_data) {
-        if (empty($this->salesnexus_api_key)) {
-            error_log('LE SalesNexus: API key not set — configure it in Settings');
+        $token = get_option('le_salesnexus_webhook_token', '');
+        if (empty($token)) {
+            error_log('LE SalesNexus: Webhook token not configured — add it in Settings');
             return false;
         }
 
-        $name  = trim($row_data['name']  ?? '');
         $email = trim($row_data['email'] ?? '');
-
-        // Email is required — skip silently without stopping the batch
         if (empty($email)) {
-            error_log('LE SalesNexus: Skipped (no email) — ' . ($name ?: 'unknown'));
+            error_log('LE SalesNexus: Skipped (no email) — ' . ($row_data['name'] ?? 'unknown'));
             return false;
         }
 
-        $parts = explode(' ', $name, 2);
-
-        $body = [
-            'firstName' => $parts[0] ?? '',
-            'lastName'  => $parts[1] ?? '',
-            'email'     => $email,
-        ];
-
-        if (! empty($row_data['phone'])) $body['phone'] = $row_data['phone'];
-
-        // leadSource and ID/Status always sent — fallback ensures empty option never removes them
-        $body['customFields'] = [
+        // Only include non-empty values — webhook skips empty fields without overwriting existing data
+        $body = array_filter([
+            'email'      => $email,
+            'name'       => $row_data['name']        ?? '',
+            'phone'      => $row_data['phone']        ?? '',
+            'linkedin'   => $row_data['linkedin']     ?? '',
+            'company'    => $row_data['company_name'] ?? '',
+            'job_title'  => $row_data['title']        ?? '',
             'leadSource' => get_option('le_salesnexus_lead_source', '') ?: 'Lead Extractor',
-            'idStatus'  => get_option('le_salesnexus_id_status',   '') ?: 'Suspect',
-        ];
+            'idstatus'   => get_option('le_salesnexus_id_status',   '') ?: 'Suspect',
+        ], fn($v) => $v !== '');
 
-        // LinkedIn only added when available
-        if (! empty($row_data['linkedin'])) {
-            $body['customFields']['LinkedIn'] = $row_data['linkedin'];
-        }
+        $webhook_url = rtrim($this->salesnexus_api_url, '/') . '/api/v1/hooks/' . $token;
 
-        $response = wp_remote_post(
-            rtrim($this->salesnexus_api_url, '/') . '/api/v1/Contacts',
-            [
-                'headers' => $this->get_salesnexus_headers(),
-                'body'    => wp_json_encode($body),
-                'timeout' => 20,
-            ]
-        );
+        $response = wp_remote_post($webhook_url, [
+            'headers' => ['Content-Type' => 'application/json'],
+            'body'    => wp_json_encode($body),
+            'timeout' => 20,
+        ]);
 
         if (is_wp_error($response)) {
-            error_log('LE SalesNexus: ' . $response->get_error_message() . ' — ' . $name);
+            error_log('LE SalesNexus: ' . $response->get_error_message());
             return false;
         }
 
         $code = wp_remote_retrieve_response_code($response);
-        if ($code >= 200 && $code < 300) {
-            $id = json_decode(wp_remote_retrieve_body($response), true)['id'] ?? '?';
-            error_log('LE SalesNexus: Saved ID:' . $id . ' — ' . $name);
+        if ($code === 200) {
+            $data = json_decode(wp_remote_retrieve_body($response), true);
+            error_log('LE SalesNexus: Contact ' . ($data['action'] ?? 'processed') . ' ID:' . ($data['contactId'] ?? '?') . ' — ' . ($row_data['name'] ?? ''));
             return true;
         }
 
-        error_log('LE SalesNexus: HTTP ' . $code . ' — ' . $name . ' — ' . wp_remote_retrieve_body($response));
+        error_log('LE SalesNexus: HTTP ' . $code . ' — ' . wp_remote_retrieve_body($response));
         return false;
     }
 
@@ -1110,11 +1109,11 @@ class Lead_Executives_Extractor {
         update_option('le_target_sheet_id', sanitize_text_field($_POST['le_target_sheet_id'] ?? ''));
         update_option('le_api_key',         sanitize_text_field($_POST['le_api_key']         ?? ''));
         update_option('le_column_name',     strtoupper(sanitize_text_field($_POST['le_column_name'] ?? 'A')));
-        update_option('le_batch_size',      absint($_POST['le_batch_size']   ?? self::DEFAULT_BATCH_SIZE));
+        $batch_size = max(1, min(20, absint($_POST['le_batch_size'] ?? 0)));
+        update_option('le_batch_size', $batch_size ?: self::DEFAULT_BATCH_SIZE);
 
-        $person_limit = absint($_POST['le_person_limit'] ?? 10);
-        $person_limit = max(1, min(50, $person_limit));
-        update_option('le_person_limit', $person_limit);
+        $person_limit = max(1, min(50, absint($_POST['le_person_limit'] ?? 0)));
+        update_option('le_person_limit', $person_limit ?: 10);
 
         error_log("LE: Settings saved — batch_size: " . get_option('le_batch_size') . " | person_limit: " . get_option('le_person_limit'));
 
@@ -1134,8 +1133,9 @@ class Lead_Executives_Extractor {
             $destination = 'salesnexus_api';
         }
         update_option('le_output_destination',      $destination);
-        update_option('le_salesnexus_api_key',      sanitize_text_field($_POST['le_salesnexus_api_key']      ?? ''));
-        update_option('le_salesnexus_api_url',      esc_url_raw($_POST['le_salesnexus_api_url']              ?? 'https://api-beta.salesnex.us'));
+        update_option('le_salesnexus_api_key',          sanitize_text_field($_POST['le_salesnexus_api_key']          ?? ''));
+        update_option('le_salesnexus_api_url',          esc_url_raw($_POST['le_salesnexus_api_url']                  ?? 'https://api-beta.salesnex.us'));
+        update_option('le_salesnexus_webhook_token',    sanitize_text_field($_POST['le_salesnexus_webhook_token']    ?? ''));
         update_option('le_salesnexus_lead_source',  sanitize_text_field($_POST['le_salesnexus_lead_source']  ?? 'Lead Extractor'));
         update_option('le_salesnexus_id_status',    sanitize_text_field($_POST['le_salesnexus_id_status']    ?? 'Suspect'));
 
@@ -1188,14 +1188,15 @@ class Lead_Executives_Extractor {
         $api_key            = esc_attr(get_option('le_api_key', ''));
         $col_name           = esc_attr(get_option('le_column_name', 'A'));
         $job_titles         = esc_attr(implode(', ', get_option('le_job_titles', [])));
-        $batch_size         = esc_attr(get_option('le_batch_size', self::DEFAULT_BATCH_SIZE));
-        $person_limit       = esc_attr(get_option('le_person_limit', 10));
+        $batch_size         = esc_attr(get_option('le_batch_size')   ?: self::DEFAULT_BATCH_SIZE);
+        $person_limit       = esc_attr(get_option('le_person_limit') ?: 10);
         $sync_enabled       = get_option('le_auto_sync_enabled', false);
         $sync_interval      = esc_attr(get_option('le_sync_interval', 'le_hourly'));
         $next_sync          = wp_next_scheduled(self::SYNC_CRON_HOOK);
         $output_destination = get_option('le_output_destination', 'salesnexus_api');
-        $snx_api_key        = esc_attr(get_option('le_salesnexus_api_key',     ''));
-        $snx_api_url        = esc_attr(get_option('le_salesnexus_api_url',     'https://api-beta.salesnex.us'));
+        $snx_api_key        = esc_attr(get_option('le_salesnexus_api_key',         ''));
+        $snx_api_url        = esc_attr(get_option('le_salesnexus_api_url',         'https://api-beta.salesnex.us'));
+        $snx_webhook_token  = esc_attr(get_option('le_salesnexus_webhook_token',   ''));
         $snx_lead_source    = esc_attr(get_option('le_salesnexus_lead_source', 'Lead Extractor'));
         $snx_id_status      = esc_attr(get_option('le_salesnexus_id_status',   'Suspect'));
 
@@ -1239,11 +1240,12 @@ class Lead_Executives_Extractor {
                 <!-- SalesNexus API fields — shown when SalesNexus API is selected -->
                 <div id="snxFields" style="display:<?php echo $output_destination === 'salesnexus_api' ? 'block' : 'none'; ?>">
                     <div class="le-field-group">
-                        <label class="le-field-label" for="le_salesnexus_api_key">🔑 SalesNexus API Key</label>
+                        <label class="le-field-label" for="le_salesnexus_webhook_token">🔗 SalesNexus Webhook Token</label>
                         <div class="le-field-row">
-                            <input type="password" id="le_salesnexus_api_key" value="<?php echo $snx_api_key; ?>" placeholder="Your SalesNexus X-Api-Key" />
-                            <a href="#" id="toggleSnxKey" class="le-open-link">👁 Show/Hide</a>
+                            <input type="password" id="le_salesnexus_webhook_token" value="<?php echo $snx_webhook_token; ?>" placeholder="Paste upsert-contact token from Settings → Webhooks" class="le-input-full" />
+                            <a href="#" id="toggleSnxToken" class="le-open-link">👁 Show/Hide</a>
                         </div>
+                        <p class="le-field-hint">Get from SalesNexus → Settings → Webhooks → upsert-contact token</p>
                     </div>
                     <div class="le-field-group">
                         <label class="le-field-label" for="le_salesnexus_api_url">🌐 SalesNexus API URL</label>
