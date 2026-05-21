@@ -3,5 +3,6 @@
 # Ignore vendor directory
 vendor/
 doc.text
+DOCUMENTATION.md
 SALESNEXUS-API-DOCS.md
 credential.json 

@@ -36,6 +36,8 @@ jQuery(function ($) {
             le_batch_size:           $('#le_batch_size').val(),
             le_person_limit:         $('#le_person_limit').val(),
             le_sync_interval:        $('#le_sync_interval').val(),
+            le_input_source:              $('#le_input_source').val(),
+            le_domain_retention_days:     $('#le_domain_retention_days').val(),
             le_output_destination:        $('#le_output_destination').val(),
             le_salesnexus_webhook_token:  $('#le_salesnexus_webhook_token').val(),
             le_salesnexus_api_url:        $('#le_salesnexus_api_url').val(),
@@ -116,6 +118,85 @@ jQuery(function ($) {
 
     // =========================================================
     // Pause
+    // =========================================================
+    // Input Source show/hide
+    // =========================================================
+    function applyInputSource(source) {
+        var isSheet   = (source === 'google_sheet');
+        var isWebhook = (source === 'salesnexus_webhook');
+
+        $('#googleSheetInputFields').toggle(isSheet);
+        $('#snxWebhookInputFields').toggle(isWebhook);
+        $('#emailColumnField').toggle(isSheet);
+        $('#syncIntervalField').toggle(isSheet);
+        $('#autoSyncCard').toggle(isSheet);
+
+        // When SalesNexus Webhook is input, output must be SalesNexus API — hide the choice
+        if (isWebhook) {
+            $('#le_output_destination').val('salesnexus_api').trigger('change');
+            $('#le_output_destination').closest('.le-field-group').hide();
+        } else {
+            $('#le_output_destination').closest('.le-field-group').show();
+        }
+    }
+
+    $('#le_input_source').on('change', function () {
+        applyInputSource($(this).val());
+    });
+
+    // Copy webhook URL to clipboard
+    $('#copyIncomingUrl').on('click', function () {
+        var url = $('#le_incoming_url').val();
+        if (navigator.clipboard) {
+            navigator.clipboard.writeText(url).then(function () {
+                showNotice('URL copied!', 'success');
+            });
+        } else {
+            $('#le_incoming_url').select();
+            document.execCommand('copy');
+            showNotice('URL copied!', 'success');
+        }
+    });
+
+    // Regenerate / Generate incoming webhook token
+    $('#regenerateIncomingToken').on('click', function () {
+        var hasExisting = $('#le_incoming_url').length > 0;
+        if (hasExisting && ! confirm('Regenerate URL? The old URL will stop working — update SalesNexus trigger too.')) return;
+
+        var $btn = $(this).prop('disabled', true).text('⏳ Generating...');
+
+        $.post(le_ajax_obj.ajax_url, { action: 'le_regenerate_incoming_token' }, function (res) {
+            if (res.success) {
+                var url = res.data.url;
+
+                if ($('#le_incoming_url').length > 0) {
+                    // Already exists — just update value
+                    $('#le_incoming_url').val(url);
+                } else {
+                    // First time — remove "No URL yet" message and inject the URL row
+                    $('#snxNoUrlMsg').remove();
+                    var $row = $(
+                        '<div class="le-field-row" id="snxUrlRow" style="margin-bottom:6px">' +
+                            '<input type="text" id="le_incoming_url" readonly class="le-input-full" />' +
+                            '<button type="button" id="copyIncomingUrl" class="button">📋 Copy</button>' +
+                        '</div>'
+                    );
+                    $btn.before($row);
+                    $('#le_incoming_url').val(url);
+                }
+
+                $btn.text('🔄 Regenerate URL').prop('disabled', false);
+                showNotice('✅ URL generated! Copy it to SalesNexus.', 'success');
+            } else {
+                showNotice('Failed to generate URL', 'error');
+                $btn.prop('disabled', false).text('🔄 Generate URL');
+            }
+        }).fail(function () {
+            showNotice('Connection error', 'error');
+            $btn.prop('disabled', false).text('🔄 Generate URL');
+        });
+    });
+
     // =========================================================
     $('#pauseBtn').on('click', function () {
         $.post(le_ajax_obj.ajax_url, { action: 'le_pause_queue' }, function (res) {
@@ -441,4 +522,6 @@ jQuery(function ($) {
     // =========================================================
     startPolling(le_ajax_obj.queue_status === 'running');
     startSyncCountdown(le_ajax_obj.next_sync);
+    // Apply correct field visibility on page load
+    applyInputSource($('#le_input_source').val());
 });

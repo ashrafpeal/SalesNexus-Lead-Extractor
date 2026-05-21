@@ -17,9 +17,11 @@ class Lead_Executives_Extractor {
     // =========================================================
 
     const QUEUE_KEY             = 'le_processing_queue';
-    const PROCESSED_DOMAINS_KEY = 'le_processed_domains';
+    const PROCESSED_DOMAINS_KEY = 'le_processed_domains'; // legacy — migrated to DB table
     const BATCH_CRON_HOOK       = 'le_batch_process_hook';
     const SYNC_CRON_HOOK        = 'le_auto_sync_hook';
+    const CLEANUP_CRON_HOOK     = 'le_cleanup_hook';
+    const DOMAINS_TABLE         = 'le_processed_domains'; // DB table name (without prefix)
 
     /**
      * ✅ FIX: BATCH_SIZE constant will no longer be used directly.
@@ -59,8 +61,13 @@ class Lead_Executives_Extractor {
         add_action('wp_ajax_nopriv_le_async_batch', [$this, 'handle_async_batch']);
         add_action('wp_ajax_le_async_batch',        [$this, 'handle_async_batch']);
 
-        add_action(self::BATCH_CRON_HOOK,  [$this, 'process_batch']);
-        add_action(self::SYNC_CRON_HOOK,   [$this, 'auto_sync_check']);
+        // Incoming webhook receiver — token-secured REST endpoint
+        add_action('rest_api_init', [$this, 'register_incoming_endpoint']);
+        add_action('wp_ajax_le_regenerate_incoming_token', [$this, 'ajax_regenerate_incoming_token']);
+
+        add_action(self::BATCH_CRON_HOOK,   [$this, 'process_batch']);
+        add_action(self::SYNC_CRON_HOOK,    [$this, 'auto_sync_check']);
+        add_action(self::CLEANUP_CRON_HOOK, [$this, 'cleanup_old_domains']);
 
         add_action('admin_enqueue_scripts', [$this, 'le_enqueue_scripts']);
         add_filter('cron_schedules',        [$this, 'add_cron_intervals']);
@@ -111,15 +118,55 @@ class Lead_Executives_Extractor {
             $interval = get_option('le_sync_interval', 'le_hourly');
             wp_schedule_event(time(), $interval, self::SYNC_CRON_HOOK);
         }
-        // Generate a persistent secret key for authenticating async loopback requests
         if (! get_option('le_async_secret')) {
             update_option('le_async_secret', bin2hex(random_bytes(16)), false);
+        }
+
+        // Create processed domains DB table
+        $this->create_domains_table();
+
+        // Schedule daily cleanup cron
+        if (! wp_next_scheduled(self::CLEANUP_CRON_HOOK)) {
+            wp_schedule_event(time(), 'daily', self::CLEANUP_CRON_HOOK);
+        }
+    }
+
+    // Create the processed domains table and migrate legacy wp_options data
+    private function create_domains_table() {
+        global $wpdb;
+        $table   = $wpdb->prefix . self::DOMAINS_TABLE;
+        $charset = $wpdb->get_charset_collate();
+
+        $sql = "CREATE TABLE IF NOT EXISTS {$table} (
+            id           INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+            domain       VARCHAR(255) NOT NULL,
+            source       VARCHAR(20)  NOT NULL DEFAULT 'manual',
+            processed_at DATETIME     NOT NULL,
+            UNIQUE KEY   uk_domain (domain),
+            INDEX        idx_processed_at (processed_at)
+        ) {$charset};";
+
+        require_once ABSPATH . 'wp-admin/includes/upgrade.php';
+        dbDelta($sql);
+
+        // Migrate existing domains from wp_options to the new table
+        $legacy = get_option(self::PROCESSED_DOMAINS_KEY, []);
+        if (! empty($legacy) && is_array($legacy)) {
+            foreach ($legacy as $domain) {
+                $wpdb->query($wpdb->prepare(
+                    "INSERT IGNORE INTO {$table} (domain, source, processed_at) VALUES (%s, %s, %s)",
+                    strtolower(trim($domain)), 'migrated', current_time('mysql')
+                ));
+            }
+            delete_option(self::PROCESSED_DOMAINS_KEY);
+            error_log('LE: Migrated ' . count($legacy) . ' domains to DB table');
         }
     }
 
     public function on_deactivate() {
         wp_clear_scheduled_hook(self::BATCH_CRON_HOOK);
         wp_clear_scheduled_hook(self::SYNC_CRON_HOOK);
+        wp_clear_scheduled_hook(self::CLEANUP_CRON_HOOK);
     }
 
     // =========================================================
@@ -136,26 +183,69 @@ class Lead_Executives_Extractor {
     }
 
     // =========================================================
-    // ✅ PROCESSED DOMAINS — persistent tracking
+    // PROCESSED DOMAINS — DB table tracking (fast, scalable)
     // =========================================================
 
-    private function get_processed_domains() {
-        return get_option(self::PROCESSED_DOMAINS_KEY, []);
+    private function domains_table() {
+        global $wpdb;
+        return $wpdb->prefix . self::DOMAINS_TABLE;
     }
 
-    private function mark_domain_processed($domain) {
-        $processed = $this->get_processed_domains();
-        $domain = strtolower(trim($domain));
-        if (! in_array($domain, $processed, true)) {
-            $processed[] = $domain;
-            update_option(self::PROCESSED_DOMAINS_KEY, $processed, false);
-        }
+    // Returns total count of all processed domains
+    private function count_processed_domains() {
+        global $wpdb;
+        return (int) $wpdb->get_var( 'SELECT COUNT(*) FROM ' . $this->domains_table() );
     }
 
+    // O(1) lookup — uses UNIQUE INDEX on domain column
     private function is_domain_processed($domain) {
-        $domain    = strtolower(trim($domain));
-        $processed = $this->get_processed_domains();
-        return in_array($domain, $processed, true);
+        global $wpdb;
+        $domain = strtolower(trim($domain));
+        $result = $wpdb->get_var($wpdb->prepare(
+            'SELECT COUNT(*) FROM ' . $this->domains_table() . ' WHERE domain = %s',
+            $domain
+        ));
+        return (int) $result > 0;
+    }
+
+    // INSERT IGNORE — silently skips if domain already exists
+    private function mark_domain_processed($domain, $source = 'manual') {
+        global $wpdb;
+        $domain = strtolower(trim($domain));
+        $wpdb->query($wpdb->prepare(
+            'INSERT IGNORE INTO ' . $this->domains_table() . ' (domain, source, processed_at) VALUES (%s, %s, %s)',
+            $domain, $source, current_time('mysql')
+        ));
+    }
+
+    // Batch check — single query for multiple domains (used in init_queue)
+    private function get_processed_domains_batch(array $domains) {
+        if (empty($domains)) return [];
+        global $wpdb;
+        $placeholders = implode(',', array_fill(0, count($domains), '%s'));
+        return $wpdb->get_col(
+            $wpdb->prepare(
+                'SELECT domain FROM ' . $this->domains_table() . " WHERE domain IN ($placeholders)",
+                ...$domains
+            )
+        );
+    }
+
+    // Deletes processed domain records older than the configured retention period
+    public function cleanup_old_domains() {
+        $days = (int) get_option('le_domain_retention_days', 90);
+        if ($days <= 0) {
+            error_log('LE Cleanup: retention set to never — skipping');
+            return;
+        }
+
+        global $wpdb;
+        $deleted = $wpdb->query($wpdb->prepare(
+            'DELETE FROM ' . $this->domains_table() . ' WHERE processed_at < DATE_SUB(NOW(), INTERVAL %d DAY)',
+            $days
+        ));
+
+        error_log("LE Cleanup: deleted {$deleted} domain records older than {$days} days");
     }
 
     // =========================================================
@@ -218,7 +308,14 @@ class Lead_Executives_Extractor {
         $items             = [];
         $skipped           = 0;
         $total_emails      = count($rows);
-        $already_processed = $this->get_processed_domains();
+        // Batch check all unique domains at once — single DB query instead of N queries
+        $unique_domains = [];
+        foreach ($rows as $row) {
+            $email  = trim($row[0] ?? '');
+            $domain = is_email($email) ? strtolower(explode('@', $email)[1] ?? '') : '';
+            if ($domain) $unique_domains[] = $domain;
+        }
+        $already_processed = $this->get_processed_domains_batch(array_unique($unique_domains));
 
         foreach ($rows as $row) {
             $email = trim($row[0] ?? '');
@@ -643,8 +740,78 @@ class Lead_Executives_Extractor {
     // append_to_existing=true → only new domains will be added
     // =========================================================
 
+    // =========================================================
+    // INCOMING WEBHOOK RECEIVER
+    // =========================================================
+
+    // Register the token-secured REST endpoint
+    public function register_incoming_endpoint() {
+        register_rest_route('le/v1', '/receive/(?P<token>[a-f0-9]+)', [
+            'methods'             => 'POST',
+            'callback'            => [$this, 'handle_incoming_webhook'],
+            'permission_callback' => '__return_true',
+        ]);
+    }
+
+    // Handle POST request from SalesNexus Stage Trigger
+    public function handle_incoming_webhook(\WP_REST_Request $request) {
+        // Verify token from URL matches stored token
+        $url_token    = $request->get_url_params()['token'] ?? '';
+        $stored_token = get_option('le_incoming_webhook_token', '');
+
+        if (empty($stored_token) || ! hash_equals($stored_token, $url_token)) {
+            return new \WP_REST_Response(['error' => 'Invalid token'], 401);
+        }
+
+        // Extract email from payload
+        $body  = $request->get_json_params() ?? [];
+        $email = sanitize_email($body['email'] ?? '');
+
+        if (empty($email) || ! is_email($email)) {
+            return new \WP_REST_Response(['error' => 'Valid email required'], 400);
+        }
+
+        // Duplicate prevention — same email within 5 minutes is silently skipped
+        $dedup_key = 'le_recv_' . md5($email);
+        if (get_transient($dedup_key)) {
+            return new \WP_REST_Response(['status' => 'skipped', 'reason' => 'duplicate'], 200);
+        }
+        set_transient($dedup_key, 1, 5 * MINUTE_IN_SECONDS);
+
+        // Add domain to existing queue (reuses current processing pipeline)
+        $queue = $this->init_queue([[$email]], 'webhook', true);
+
+        // Trigger background processing immediately
+        if (! empty($queue['pending']) && $queue['status'] === 'running') {
+            $this->trigger_async_batch(3);
+        }
+
+        error_log('LE Webhook: Received ' . $email . ' — queued for processing');
+        return new \WP_REST_Response(['status' => 'queued', 'email' => $email], 200);
+    }
+
+    // AJAX — regenerate incoming webhook token
+    public function ajax_regenerate_incoming_token() {
+        if (! current_user_can('manage_options')) {
+            wp_send_json_error(['message' => 'Unauthorized']);
+        }
+        $token = bin2hex(random_bytes(16));
+        update_option('le_incoming_webhook_token', $token);
+        $url = rest_url('le/v1/receive/' . $token);
+        wp_send_json_success(['token' => $token, 'url' => $url]);
+    }
+
+    // =========================================================
+    // AUTO SYNC
+    // =========================================================
+
     public function auto_sync_check() {
         if (! get_option('le_auto_sync_enabled', false)) {
+            return;
+        }
+
+        // Auto sync only applies to Google Sheet input — webhook input is event-driven
+        if (get_option('le_input_source', 'salesnexus_webhook') !== 'google_sheet') {
             return;
         }
 
@@ -1105,12 +1272,21 @@ class Lead_Executives_Extractor {
             return;
         }
 
+        $input_source = sanitize_text_field($_POST['le_input_source'] ?? 'salesnexus_webhook');
+        if (! in_array($input_source, ['google_sheet', 'salesnexus_webhook'], true)) {
+            $input_source = 'google_sheet';
+        }
+        update_option('le_input_source', $input_source);
+
         update_option('le_source_sheet_id', sanitize_text_field($_POST['le_source_sheet_id'] ?? ''));
         update_option('le_target_sheet_id', sanitize_text_field($_POST['le_target_sheet_id'] ?? ''));
         update_option('le_api_key',         sanitize_text_field($_POST['le_api_key']         ?? ''));
         update_option('le_column_name',     strtoupper(sanitize_text_field($_POST['le_column_name'] ?? 'A')));
         $batch_size = max(1, min(20, absint($_POST['le_batch_size'] ?? 0)));
         update_option('le_batch_size', $batch_size ?: self::DEFAULT_BATCH_SIZE);
+
+        $retention = absint($_POST['le_domain_retention_days'] ?? 90);
+        update_option('le_domain_retention_days', in_array($retention, [0, 30, 60, 90, 180, 365], true) ? $retention : 90);
 
         $person_limit = max(1, min(50, absint($_POST['le_person_limit'] ?? 0)));
         update_option('le_person_limit', $person_limit ?: 10);
@@ -1135,7 +1311,13 @@ class Lead_Executives_Extractor {
         update_option('le_output_destination',      $destination);
         update_option('le_salesnexus_api_key',          sanitize_text_field($_POST['le_salesnexus_api_key']          ?? ''));
         update_option('le_salesnexus_api_url',          esc_url_raw($_POST['le_salesnexus_api_url']                  ?? 'https://api-beta.salesnex.us'));
-        update_option('le_salesnexus_webhook_token',    sanitize_text_field($_POST['le_salesnexus_webhook_token']    ?? ''));
+        // Accept full URL or just the token — extract token if full URL is pasted
+        $raw_token = sanitize_text_field($_POST['le_salesnexus_webhook_token'] ?? '');
+        if (strpos($raw_token, '/api/v1/hooks/') !== false) {
+            $parts     = explode('/api/v1/hooks/', $raw_token);
+            $raw_token = trim($parts[1] ?? '');
+        }
+        update_option('le_salesnexus_webhook_token', $raw_token);
         update_option('le_salesnexus_lead_source',  sanitize_text_field($_POST['le_salesnexus_lead_source']  ?? 'Lead Extractor'));
         update_option('le_salesnexus_id_status',    sanitize_text_field($_POST['le_salesnexus_id_status']    ?? 'Suspect'));
 
@@ -1150,7 +1332,7 @@ class Lead_Executives_Extractor {
         $total   = max(1, $queue['total']);
         $done    = count($queue['processed']);
         $percent = min(100, round(($done / $total) * 100));
-        $processed_all_time = count($this->get_processed_domains());
+        $processed_all_time = $this->count_processed_domains();
 
         return [
             'status'             => $queue['status'],
@@ -1193,6 +1375,9 @@ class Lead_Executives_Extractor {
         $sync_enabled       = get_option('le_auto_sync_enabled', false);
         $sync_interval      = esc_attr(get_option('le_sync_interval', 'le_hourly'));
         $next_sync          = wp_next_scheduled(self::SYNC_CRON_HOOK);
+        $input_source       = get_option('le_input_source', 'salesnexus_webhook');
+        $incoming_token     = get_option('le_incoming_webhook_token', '');
+        $incoming_url       = $incoming_token ? rest_url('le/v1/receive/' . $incoming_token) : '';
         $output_destination = get_option('le_output_destination', 'salesnexus_api');
         $snx_api_key        = esc_attr(get_option('le_salesnexus_api_key',         ''));
         $snx_api_url        = esc_attr(get_option('le_salesnexus_api_url',         'https://api-beta.salesnex.us'));
@@ -1214,17 +1399,50 @@ class Lead_Executives_Extractor {
             <div class="le-card">
                 <h2 class="le-card-title">⚙️ Settings</h2>
 
+                <!-- Input Source selector -->
                 <div class="le-field-group">
-                    <label class="le-field-label" for="le_source_sheet_id">📄 Source Sheet ID</label>
-                    <div class="le-field-row">
-                        <input type="text" id="le_source_sheet_id" value="<?php echo $source_id; ?>" placeholder="Google Sheet ID" />
-                        <?php if ($source_id): ?>
-                            <a class="le-open-link" href="https://docs.google.com/spreadsheets/d/<?php echo $source_id; ?>/edit" target="_blank">🔗 Open</a>
-                        <?php endif; ?>
+                    <label class="le-field-label" for="le_input_source">📥 Input Source</label>
+                    <select id="le_input_source">
+                        <option value="google_sheet"       <?php selected($input_source, 'google_sheet'); ?>>Google Sheet</option>
+                        <option value="salesnexus_webhook" <?php selected($input_source, 'salesnexus_webhook'); ?>>SalesNexus Webhook</option>
+                    </select>
+                </div>
+
+                <!-- Google Sheet input fields -->
+                <div id="googleSheetInputFields" style="display:<?php echo $input_source === 'google_sheet' ? 'block' : 'none'; ?>">
+                    <div class="le-field-group">
+                        <label class="le-field-label" for="le_source_sheet_id">📄 Source Sheet ID</label>
+                        <div class="le-field-row">
+                            <input type="text" id="le_source_sheet_id" value="<?php echo $source_id; ?>" placeholder="Google Sheet ID" />
+                            <?php if ($source_id): ?>
+                                <a class="le-open-link" href="https://docs.google.com/spreadsheets/d/<?php echo $source_id; ?>/edit" target="_blank">🔗 Open</a>
+                            <?php endif; ?>
+                        </div>
+                        <div class="le-field-notice">
+                            ⚠️ This sheet must be shared with:
+                            <code>salesnexus@salesnexus-user-sheet.iam.gserviceaccount.com</code>
+                        </div>
                     </div>
-                    <div class="le-field-notice">
-                        ⚠️ This sheet must be shared with:
-                        <code>salesnexus@salesnexus-user-sheet.iam.gserviceaccount.com</code>
+                </div>
+
+                <!-- SalesNexus Webhook input fields -->
+                <div id="snxWebhookInputFields" style="display:<?php echo $input_source === 'salesnexus_webhook' ? 'block' : 'none'; ?>">
+                    <div class="le-field-group">
+                        <label class="le-field-label">🔗 Your Webhook URL</label>
+                        <p class="le-field-hint">Copy this URL into SalesNexus → Stage Trigger → Post Webhook → URL field</p>
+                        <?php if ($incoming_url): ?>
+                            <div class="le-field-row">
+                                <input type="text" id="le_incoming_url" value="<?php echo esc_attr($incoming_url); ?>" readonly class="le-input-full" />
+                                <button type="button" id="copyIncomingUrl" class="button">📋 Copy</button>
+                            </div>
+                            <p class="le-field-hint" style="color:#888">Payload to use in SalesNexus: <code>{"email":"{{email}}","name":"{{full_name}}","phone":"{{phone}}"}</code></p>
+                        <?php else: ?>
+                            <p id="snxNoUrlMsg" class="le-field-hint" style="color:#d63638">⚠️ No URL yet — click Generate below</p>
+                        <?php endif; ?>
+                        <button type="button" id="regenerateIncomingToken" class="button button-secondary" style="margin-top:8px">
+                            🔄 <?php echo $incoming_url ? 'Regenerate URL' : 'Generate URL'; ?>
+                        </button>
+                        <p class="le-field-hint" style="color:#d63638">⚠️ Regenerating will break existing SalesNexus triggers using the old URL</p>
                     </div>
                 </div>
 
@@ -1242,10 +1460,10 @@ class Lead_Executives_Extractor {
                     <div class="le-field-group">
                         <label class="le-field-label" for="le_salesnexus_webhook_token">🔗 SalesNexus Webhook Token</label>
                         <div class="le-field-row">
-                            <input type="password" id="le_salesnexus_webhook_token" value="<?php echo $snx_webhook_token; ?>" placeholder="Paste upsert-contact token from Settings → Webhooks" class="le-input-full" />
+                            <input type="password" id="le_salesnexus_webhook_token" value="<?php echo $snx_webhook_token; ?>" placeholder="Paste token or full URL — e.g. https://api-beta.salesnex.us/api/v1/hooks/YOUR_TOKEN" class="le-input-full" />
                             <a href="#" id="toggleSnxToken" class="le-open-link">👁 Show/Hide</a>
                         </div>
-                        <p class="le-field-hint">Get from SalesNexus → Settings → Webhooks → upsert-contact token</p>
+                        <p class="le-field-hint">Get from SalesNexus → Settings → Webhooks → Insert or update a contact</p>
                     </div>
                     <div class="le-field-group">
                         <label class="le-field-label" for="le_salesnexus_api_url">🌐 SalesNexus API URL</label>
@@ -1287,7 +1505,7 @@ class Lead_Executives_Extractor {
                     </div>
                 </div>
 
-                <div class="le-field-group">
+                <div class="le-field-group" id="emailColumnField" style="display:<?php echo $input_source === 'google_sheet' ? 'block' : 'none'; ?>">
                     <label class="le-field-label" for="le_column_name">📧 Email Column</label>
                     <input type="text" id="le_column_name" value="<?php echo $col_name; ?>" maxlength="3" placeholder="A" class="le-input-short" />
                 </div>
@@ -1317,6 +1535,19 @@ class Lead_Executives_Extractor {
                 </div>
 
                 <div class="le-field-group">
+                    <label class="le-field-label" for="le_domain_retention_days">🗑️ Domain History Retention</label>
+                    <select id="le_domain_retention_days">
+                        <?php
+                        $retention = (int) get_option('le_domain_retention_days', 90);
+                        $options   = [30 => '30 Days', 60 => '60 Days', 90 => '90 Days (Recommended)', 180 => '180 Days', 365 => '1 Year', 0 => 'Never Delete'];
+                        foreach ($options as $val => $label): ?>
+                            <option value="<?php echo $val; ?>" <?php selected($retention, $val); ?>><?php echo $label; ?></option>
+                        <?php endforeach; ?>
+                    </select>
+                    <p class="le-field-hint">Processed domains older than this will be deleted automatically. Deleted domains can be re-processed.</p>
+                </div>
+
+                <div class="le-field-group" id="syncIntervalField" style="display:<?php echo $input_source === 'google_sheet' ? 'block' : 'none'; ?>">
                     <label class="le-field-label" for="le_sync_interval">🕐 Auto Sync Interval</label>
                     <select id="le_sync_interval">
                         <option value="le_every_2_min" <?php selected($sync_interval, 'le_every_2_min'); ?>>Every 2 Minutes</option>
@@ -1333,8 +1564,8 @@ class Lead_Executives_Extractor {
                 </div>
             </div>
 
-            <!-- AUTO SYNC -->
-            <div class="le-card">
+            <!-- AUTO SYNC — only shown for Google Sheet input source -->
+            <div class="le-card" id="autoSyncCard" style="display:<?php echo $input_source === 'google_sheet' ? 'block' : 'none'; ?>">
                 <h2 class="le-card-title">🔄 Auto Sync</h2>
                 <div class="le-sync-info">
                     <div class="le-sync-row">
